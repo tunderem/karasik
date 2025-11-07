@@ -1,12 +1,12 @@
 import asyncio
 import logging
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import BadRequest, TimedOut
 import time
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Настройка логирования
 logging.basicConfig(
@@ -26,6 +26,11 @@ class MondayAttendanceBot:
         self.last_poll_message_id = None
         self.current_poll_id = None
         self.votes = {}
+        self.mute_settings = {
+            'enabled': True,
+            'duration': 300,  # 5 минут по умолчанию
+            'reply_to_mute': True
+        }
         self.application = Application.builder().token(token).build()
 
         # Обработчики команд
@@ -37,10 +42,27 @@ class MondayAttendanceBot:
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("id", self.id_command))
         self.application.add_handler(CommandHandler("fuck", self.fuck_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("fix_rights", self.fix_rights_command))
+
+        # Команды мута
+        self.application.add_handler(CommandHandler("mute", self.mute_command))
+        self.application.add_handler(CommandHandler("unmute", self.unmute_command))
+        self.application.add_handler(CommandHandler("mute_settings", self.mute_settings_command))
+        self.application.add_handler(CommandHandler("mute_enable", self.mute_enable_command))
+        self.application.add_handler(CommandHandler("mute_disable", self.mute_disable_command))
+        self.application.add_handler(CommandHandler("mutelist", self.mute_list_command))
 
         # Обработчики callback'ов
         self.application.add_handler(CallbackQueryHandler(self.handle_vote, pattern="^vote_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_admin, pattern="^admin_"))
+        self.application.add_handler(CallbackQueryHandler(self.handle_mute, pattern="^mute_"))
+
+        # Обработчик ответов на сообщения для мута
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/mute\b'), self.handle_reply_mute))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/unmute\b'), self.handle_reply_unmute))
 
     def save_data(self):
         """Сохраняем данные голосования с обработкой кодировки"""
@@ -50,6 +72,7 @@ class MondayAttendanceBot:
                 'last_poll_message_id': self.last_poll_message_id,
                 'current_poll_id': self.current_poll_id,
                 'votes': self.votes,
+                'mute_settings': self.mute_settings,
                 'last_updated': datetime.now().isoformat()
             }
             with open('attendance_data.json', 'w', encoding='utf-8') as f:
@@ -68,10 +91,14 @@ class MondayAttendanceBot:
                     self.last_poll_message_id = data.get('last_poll_message_id')
                     self.current_poll_id = data.get('current_poll_id')
                     self.votes = data.get('votes', {})
+                    self.mute_settings = data.get('mute_settings', {
+                        'enabled': True,
+                        'duration': 300,
+                        'reply_to_mute': True
+                    })
                     logger.info("Данные загружены")
         except json.JSONDecodeError as e:
             logger.error(f"Ошибка JSON: {e}. Создаем новые данные.")
-            # Создаем backup поврежденного файла
             if os.path.exists('attendance_data.json'):
                 os.rename('attendance_data.json', f'attendance_data_backup_{int(time.time())}.json')
             self.votes = {}
@@ -98,56 +125,636 @@ class MondayAttendanceBot:
             return False
         return True
 
-    async def fuck_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для отправки нахуй"""
-        user = update.effective_user
+    # ========== КОМАНДЫ МУТА ==========
+
+    async def mute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мут пользователя на указанное время"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ <b>Использование:</b>\n"
+                "<code>/mute @username</code> - замутить на время по умолчанию\n"
+                "<code>/mute @username 10m</code> - замутить на 10 минут\n"
+                "<code>/mute @username 1h</code> - замутить на 1 час\n"
+                "<code>/mute @username 1d</code> - замутить на 1 день\n"
+                "<code>/mute @username 1w</code> - замутить на 1 неделю\n"
+                "<code>/mute 123456789</code> - замутить по ID на время по умолчанию\n\n"
+                "Или просто ответьте на сообщение пользователя с командой <code>/mute</code>\n\n"
+                "💡 <i>Подсказка: используйте /mute_settings для настроек</i>",
+                parse_mode='HTML'
+            )
+            return
+
+        # Парсим аргументы
+        username_or_id = context.args[0]
+
+        # Если передан только один аргумент, используем время по умолчанию
+        if len(context.args) == 1:
+            duration_str = "10m"  # время по умолчанию
+        else:
+            duration_str = context.args[1]
+
+        # Проверяем, является ли первый аргумент временем (если передан только один аргумент)
+        if len(context.args) == 1:
+            # Проверяем, не является ли единственный аргумент временем
+            parsed_duration = await self.parse_duration(username_or_id)
+            if parsed_duration:
+                # Если это время, значит username не указан - ошибка
+                await update.message.reply_text(
+                    "❌ <b>Не указан пользователь!</b>\n\n"
+                    "<code>/mute @username 10m</code> - замутить пользователя\n"
+                    "<code>/mute @username</code> - замутить на время по умолчанию\n\n"
+                    "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>",
+                    parse_mode='HTML'
+                )
+                return
+
+        # Парсим время
+        duration = await self.parse_duration(duration_str)
+        if not duration:
+            await update.message.reply_text("❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w")
+            return
+
+        try:
+            user_id = await self.get_user_id_by_username(username_or_id, update.effective_chat.id, context)
+            until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
+
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                permissions=self.get_mute_permissions(),
+                until_date=until_date
+            )
+
+            user_info = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+            user_name = user_info.user.full_name
+
+            await update.message.reply_text(
+                f"🔇 <b>{user_name} замьючен на {self.format_duration(duration)}</b>\n\n"
+                f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"🆔 ID: <code>{user_id}</code>\n\n"
+                f"💡 <i>Используйте /unmute @{username_or_id} для размута</i>",
+                parse_mode='HTML'
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await update.message.reply_text("❌ У бота недостаточно прав для ограничения пользователей")
+            elif "user is an administrator" in str(e).lower():
+                await update.message.reply_text("❌ Нельзя замутить администратора")
+            else:
+                await update.message.reply_text(f"❌ Ошибка мута: {e}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка мута: {e}")
+
+    async def unmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Размут пользователя"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ <b>Использование:</b>\n"
+                "<code>/unmute @username</code>\n"
+                "<code>/unmute 123456789</code> - размутить по ID\n\n"
+                "Или просто ответьте на сообщение пользователя с командой <code>/unmute</code>\n\n"
+                "💡 <i>Подсказка: можно использовать ID пользователя вместо @username</i>",
+                parse_mode='HTML'
+            )
+            return
+
+        username = context.args[0]
+
+        try:
+            user_id = await self.get_user_id_by_username(username, update.effective_chat.id, context)
+
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                permissions=self.get_unmute_permissions()
+            )
+
+            user_info = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+            user_name = user_info.user.full_name
+
+            await update.message.reply_text(
+                f"🔊 <b>{user_name} размьючен</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n\n"
+                f"💡 <i>Пользователь снова может писать сообщения</i>",
+                parse_mode='HTML'
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await update.message.reply_text("❌ У бота недостаточно прав для изменения прав пользователей")
+            else:
+                await update.message.reply_text(f"❌ Ошибка размута: {e}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка размута: {e}")
+
+    async def mute_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать список замьюченных пользователей"""
+        if not await self.check_admin_access(update):
+            return
+
+        try:
+            chat_id = update.effective_chat.id
+            muted_users = []
+
+            async for member in context.bot.get_chat_members(chat_id):
+                if member.status in ['restricted', 'kicked']:
+                    user = member.user
+                    permissions = member.permissions
+
+                    if not permissions.can_send_messages:
+                        user_info = f"👤 {user.full_name}"
+                        if user.username:
+                            user_info += f" (@{user.username})"
+                        user_info += f" | ID: <code>{user.id}</code>"
+
+                        if member.until_date:
+                            time_left = member.until_date - datetime.now(timezone.utc)
+                            if time_left.total_seconds() > 0:
+                                user_info += f" | ⏰ {self.format_duration(int(time_left.total_seconds()))}"
+
+                        muted_users.append(user_info)
+
+            if muted_users:
+                text = "🔇 <b>Замьюченные пользователи:</b>\n\n" + "\n".join(muted_users)
+            else:
+                text = "✅ <b>Нет замьюченных пользователей</b>"
+
+            await update.message.reply_text(text, parse_mode='HTML')
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
+
+    async def mute_settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Настройки автоматического мута"""
+        if not await self.check_admin_access(update):
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Включить авто-мут", callback_data="mute_enable"),
+                InlineKeyboardButton("❌ Выключить авто-мут", callback_data="mute_disable")
+            ],
+            [
+                InlineKeyboardButton("⏰ 5 минут", callback_data="mute_duration_300"),
+                InlineKeyboardButton("⏰ 15 минут", callback_data="mute_duration_900"),
+                InlineKeyboardButton("⏰ 1 час", callback_data="mute_duration_3600")
+            ],
+            [
+                InlineKeyboardButton("⏰ 1 день", callback_data="mute_duration_86400"),
+                InlineKeyboardButton("⏰ 1 неделя", callback_data="mute_duration_604800")
+            ],
+            [
+                InlineKeyboardButton("📋 Помощь по муту", callback_data="mute_help"),
+                InlineKeyboardButton("👥 Список мутов", callback_data="mute_list")
+            ]
+        ]
+
+        status = "✅ ВКЛЮЧЕН" if self.mute_settings['enabled'] else "❌ ВЫКЛЮЧЕН"
+        duration = self.format_duration(self.mute_settings['duration'])
+
         await update.message.reply_text(
-            f"🖕 {user.full_name}, пошёл нахуй! Не командуй тут, уёбок!"
+            f"⚙️ <b>Настройки автоматического мута</b>\n\n"
+            f"📊 <b>Статус:</b> {status}\n"
+            f"⏰ <b>Длительность по умолчанию:</b> {duration}\n"
+            f"🔗 <b>Мут по ответу:</b> {'✅' if self.mute_settings['reply_to_mute'] else '❌'}\n\n"
+            f"💡 <i>Чтобы замьютить пользователя, просто ответьте на его сообщение командой /mute</i>\n\n"
+            f"🔧 <i>Команды: /mute @user 1h • /unmute @user • /mutelist • /mute_settings</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
+
+    async def mute_enable_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включить авто-мут"""
+        if not await self.check_admin_access(update):
+            return
+
+        self.mute_settings['enabled'] = True
+        self.save_data()
+        await update.message.reply_text(
+            "✅ <b>Автоматический мут включен</b>\n\n"
+            "💡 <i>Теперь можно мутить пользователей через ответ на их сообщения</i>",
+            parse_mode='HTML'
+        )
+
+    async def mute_disable_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выключить авто-мут"""
+        if not await self.check_admin_access(update):
+            return
+
+        self.mute_settings['enabled'] = False
+        self.save_data()
+        await update.message.reply_text(
+            "❌ <b>Автоматический мут выключен</b>\n\n"
+            "💡 <i>Мут через ответ на сообщения больше не работает</i>",
+            parse_mode='HTML'
+        )
+
+    async def handle_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка настроек мута"""
+        query = update.callback_query
+        user = query.from_user
+
+        if not await self.is_admin(user.id):
+            await query.answer("🚫 Нет прав!", show_alert=True)
+            return
+
+        data = query.data
+
+        try:
+            if data == "mute_enable":
+                self.mute_settings['enabled'] = True
+                await query.answer("✅ Авто-мут включен")
+                await self.update_mute_settings_message(query)
+
+            elif data == "mute_disable":
+                self.mute_settings['enabled'] = False
+                await query.answer("❌ Авто-мут выключен")
+                await self.update_mute_settings_message(query)
+
+            elif data.startswith("mute_duration_"):
+                duration = int(data.split('_')[2])
+                self.mute_settings['duration'] = duration
+                await query.answer(f"⏰ Длительность установлена: {self.format_duration(duration)}")
+                await self.update_mute_settings_message(query)
+
+            elif data == "mute_help":
+                await query.answer()
+                await query.message.reply_text(
+                    "📋 <b>Помощь по командам мута:</b>\n\n"
+                    "🔇 <b>Основные команды:</b>\n"
+                    "<code>/mute @username 10m</code> - мут на 10 минут\n"
+                    "<code>/mute @username 1h</code> - мут на 1 час\n"
+                    "<code>/mute @username 1d</code> - мут на 1 день\n"
+                    "<code>/mute @username 1w</code> - мут на 1 неделю\n"
+                    "<code>/unmute @username</code> - размутить\n"
+                    "<code>/mutelist</code> - список мутов\n\n"
+                    "⚡ <b>Быстрый мут:</b>\n"
+                    "Ответьте на сообщение командой <code>/mute</code>\n"
+                    "Ответьте на сообщение командой <code>/unmute</code>\n\n"
+                    "⚙️ <b>Настройки:</b>\n"
+                    "<code>/mute_settings</code> - панель управления\n"
+                    "<code>/mute_enable</code> - включить авто-мут\n"
+                    "<code>/mute_disable</code> - выключить авто-мут\n\n"
+                    "🔧 <b>Проверка прав:</b>\n"
+                    "<code>/fix_rights</code> - проверить права бота",
+                    parse_mode='HTML'
+                )
+                return
+
+            elif data == "mute_list":
+                await query.answer()
+                await self.mute_list_command(update, context)
+                return
+
+            self.save_data()
+
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                await query.answer()
+            else:
+                logger.error(f"Ошибка BadRequest в handle_mute: {e}")
+                await query.answer("❌ Ошибка")
+        except Exception as e:
+            logger.error(f"Ошибка обработки мута: {e}")
+            await query.answer("❌ Ошибка")
+
+    async def handle_reply_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ответов на сообщения для мута"""
+        if not self.mute_settings['enabled']:
+            return
+
+        if not await self.is_admin(update.effective_user.id):
+            return
+
+        replied_message = update.message.reply_to_message
+        if not replied_message:
+            return
+
+        user_to_mute = replied_message.from_user
+
+        # Проверяем, не пытаемся ли замутить бота или администратора
+        if user_to_mute.id == context.bot.id:
+            await update.message.reply_text("❌ Не могу замутить самого себя!")
+            return
+
+        try:
+            # Проверяем, является ли пользователь администратором
+            chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_to_mute.id)
+            if chat_member.status in ['administrator', 'creator']:
+                await update.message.reply_text("❌ Нельзя замутить администратора!")
+                return
+        except:
+            pass
+
+        # Парсим время из команды
+        command_parts = update.message.text.split()
+        duration_str = command_parts[1] if len(command_parts) > 1 else None
+
+        duration = self.mute_settings['duration']
+        if duration_str:
+            parsed_duration = await self.parse_duration(duration_str)
+            if parsed_duration:
+                duration = parsed_duration
+
+        try:
+            until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_to_mute.id,
+                permissions=self.get_mute_permissions(),
+                until_date=until_date
+            )
+
+            await update.message.reply_text(
+                f"🔇 <b>{user_to_mute.full_name} замьючен на {self.format_duration(duration)}</b>\n\n"
+                f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"🆔 ID: <code>{user_to_mute.id}</code>\n\n"
+                f"💡 <i>Используйте /unmute @{user_to_mute.username or user_to_mute.id} для размута</i>",
+                parse_mode='HTML'
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await update.message.reply_text("❌ У бота недостаточно прав для ограничения пользователей")
+            elif "user is an administrator" in str(e).lower():
+                await update.message.reply_text("❌ Нельзя замутить администратора")
+            else:
+                await update.message.reply_text(f"❌ Ошибка мута: {e}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка мута: {e}")
+
+    async def handle_reply_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ответов на сообщения для размута"""
+        if not await self.is_admin(update.effective_user.id):
+            return
+
+        replied_message = update.message.reply_to_message
+        if not replied_message:
+            return
+
+        user_to_unmute = replied_message.from_user
+
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_to_unmute.id,
+                permissions=self.get_unmute_permissions()
+            )
+
+            await update.message.reply_text(
+                f"🔊 <b>{user_to_unmute.full_name} размьючен</b>\n\n"
+                f"🆔 ID: <code>{user_to_unmute.id}</code>\n\n"
+                f"💡 <i>Пользователь снова может писать сообщения</i>",
+                parse_mode='HTML'
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await update.message.reply_text("❌ У бота недостаточно прав для изменения прав пользователей")
+            else:
+                await update.message.reply_text(f"❌ Ошибка размута: {e}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка размута: {e}")
+
+    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ МУТА ==========
+
+    async def parse_duration(self, duration_str):
+        """Парсит строку времени в секунды"""
+        try:
+            duration_str = duration_str.lower().strip()
+
+            if duration_str.endswith('m'):
+                return int(duration_str[:-1]) * 60
+            elif duration_str.endswith('h'):
+                return int(duration_str[:-1]) * 3600
+            elif duration_str.endswith('d'):
+                return int(duration_str[:-1]) * 86400
+            elif duration_str.endswith('w'):
+                return int(duration_str[:-1]) * 604800
+            else:
+                # Если просто число, считаем минутами
+                return int(duration_str) * 60
+        except:
+            return None
+
+    def format_duration(self, seconds):
+        """Форматирует секунды в читаемый вид"""
+        if seconds < 60:
+            return f"{seconds} сек"
+        elif seconds < 3600:
+            return f"{seconds // 60} мин"
+        elif seconds < 86400:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            if minutes > 0:
+                return f"{hours} ч {minutes} мин"
+            else:
+                return f"{hours} ч"
+        else:
+            days = seconds // 86400
+            hours = (seconds % 86400) // 3600
+            if hours > 0:
+                return f"{days} дн {hours} ч"
+            else:
+                return f"{days} дн"
+
+    def get_mute_permissions(self):
+        """Возвращает права для мута"""
+        return ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+
+    def get_unmute_permissions(self):
+        """Возвращает стандартные права"""
+        return ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=True,
+            can_pin_messages=False
+        )
+
+    async def get_user_id_by_username(self, username, chat_id, context):
+        """Получает ID пользователя по username или ID"""
+        if username.startswith('@'):
+            username = username[1:]
+
+        # Пробуем как ID
+        try:
+            user_id = int(username)
+            # Проверяем, существует ли пользователь с таким ID в чате
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                return user_id
+            except:
+                pass  # Продолжаем поиск по username
+        except ValueError:
+            pass  # Это не число, продолжаем поиск по username
+
+        try:
+            # Ищем среди участников чата
+            async for member in context.bot.get_chat_members(chat_id):
+                user = member.user
+
+                # Поиск по username
+                if user.username and user.username.lower() == username.lower():
+                    return user.id
+
+                # Поиск по полному имени (без учета регистра)
+                if user.full_name.lower() == username.lower():
+                    return user.id
+
+                # Поиск по части username
+                if user.username and username.lower() in user.username.lower():
+                    return user.id
+
+                # Поиск по части имени
+                if username.lower() in user.full_name.lower():
+                    return user.id
+
+            raise Exception(f"Пользователь '{username}' не найден в этом чате")
+
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя: {e}")
+            raise Exception(f"Пользователь '{username}' не найден в этом чате")
+
+    async def update_mute_settings_message(self, query):
+        """Обновляет сообщение с настройками мута"""
+        status = "✅ ВКЛЮЧЕН" if self.mute_settings['enabled'] else "❌ ВЫКЛЮЧЕН"
+        duration = self.format_duration(self.mute_settings['duration'])
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Включить авто-мут", callback_data="mute_enable"),
+                InlineKeyboardButton("❌ Выключить авто-мут", callback_data="mute_disable")
+            ],
+            [
+                InlineKeyboardButton("⏰ 5 минут", callback_data="mute_duration_300"),
+                InlineKeyboardButton("⏰ 15 минут", callback_data="mute_duration_900"),
+                InlineKeyboardButton("⏰ 1 час", callback_data="mute_duration_3600")
+            ],
+            [
+                InlineKeyboardButton("⏰ 1 день", callback_data="mute_duration_86400"),
+                InlineKeyboardButton("⏰ 1 неделя", callback_data="mute_duration_604800")
+            ],
+            [
+                InlineKeyboardButton("📋 Помощь по муту", callback_data="mute_help"),
+                InlineKeyboardButton("👥 Список мутов", callback_data="mute_list")
+            ]
+        ]
+
+        text = (
+            f"⚙️ <b>Настройки автоматического мута</b>\n\n"
+            f"📊 <b>Статус:</b> {status}\n"
+            f"⏰ <b>Длительность по умолчанию:</b> {duration}\n"
+            f"🔗 <b>Мут по ответу:</b> {'✅' if self.mute_settings['reply_to_mute'] else '❌'}\n\n"
+            f"💡 <i>Чтобы замьютить пользователя, просто ответьте на его сообщение командой /mute</i>\n\n"
+            f"🔧 <i>Команды: /mute @user 1h • /unmute @user • /mutelist • /mute_settings</i>"
+        )
+
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                # Сообщение не изменилось - это нормально
+                pass
+            else:
+                raise
+
+    # ========== ОСНОВНЫЕ КОМАНДЫ ==========
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Помощь по всем командам"""
+        help_text = (
+            "🤖 <b>Помощь по командам бота</b>\n\n"
+
+            "📅 <b>Посещаемость:</b>\n"
+            "<code>/start</code> - активация бота\n"
+            "<code>/attendance</code> - текущее голосование\n"
+            "<code>/results</code> - результаты голосования\n"
+            "<code>/voters</code> - кто как голосовал\n"
+            "<code>/admin</code> - панель управления\n"
+            "<code>/status</code> - статус бота\n\n"
+
+            "🔇 <b>Модерация:</b>\n"
+            "<code>/mute @user 1h</code> - мут пользователя\n"
+            "<code>/unmute @user</code> - размутить\n"
+            "<code>/mutelist</code> - список мутов\n"
+            "<code>/mute_settings</code> - настройки мута\n"
+            "<code>/fix_rights</code> - проверить права\n\n"
+
+            "🎯 <b>Другие команды:</b>\n"
+            "<code>/id</code> - узнать свой ID\n"
+            "<code>/fuck</code> - отправить нахуй\n"
+            "<code>/help</code> - эта справка\n\n"
+
+            "⚡ <b>Быстрые действия:</b>\n"
+            "• Ответьте <code>/mute</code> на сообщение для мута\n"
+            "• Ответьте <code>/unmute</code> на сообщение для размута\n"
+            "• Нажмите кнопку в закрепленном сообщении для голосования\n\n"
+
+            "💡 <i>Бот автоматически создает голосования каждый понедельник в 19:00</i>"
+        )
+
+        await update.message.reply_text(help_text, parse_mode='HTML')
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_admin_access(update):
             return
 
         self.chat_id = update.effective_chat.id
-        user = update.effective_user
-
-        logger.info(f"Бот активирован в чате {self.chat_id}")
 
         await update.message.reply_text(
             "✅ <b>Бот для учета посещаемости активирован!</b>\n\n"
             "📅 <b>Каждый понедельник в 19:00</b> я буду создавать новое голосование.\n\n"
-            "📋 <b>Команды:</b>\n"
-            "/attendance - текущее голосование\n"
-            "/results - результаты\n"
-            "/voters - кто как голосовал\n"
-            "/admin - управление\n"
-            "/status - статус бота\n"
-            "/fuck - отправить нахуй\n\n"
-            "<i>Просто нажмите на кнопку в закрепленном сообщении чтобы отметить свое присутствие</i>",
+            "⚡ <b>Основные команды:</b>\n"
+            "<code>/attendance</code> - голосование\n"
+            "<code>/results</code> - результаты\n"
+            "<code>/mute @user 1h</code> - мут\n"
+            "<code>/mutelist</code> - список мутов\n"
+            "<code>/mute_settings</code> - настройки\n\n"
+            "💡 <i>Используйте /help для полного списка команд</i>",
             parse_mode='HTML'
         )
         self.save_data()
 
-        # Создаем голосование после активации
         await self.create_monday_poll()
 
     async def attendance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /attendance для быстрого голосования"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
 
         if not self.current_poll_id:
-            await update.message.reply_text("❌ Сейчас нет активного голосования. Новое создастся в понедельник в 19:00")
+            await update.message.reply_text(
+                "❌ Сейчас нет активного голосования\n\n"
+                "💡 <i>Новое создастся в понедельник в 19:00 или через /admin</i>",
+                parse_mode='HTML'
+            )
         else:
             await update.message.reply_text(
-                "Голосование уже активно! Используйте кнопки в закрепленном сообщении."
+                "✅ Голосование уже активно!\n\n"
+                "💡 <i>Используйте кнопки в закрепленном сообщении</i>",
+                parse_mode='HTML'
             )
 
     async def results_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /results для показа результатов"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
 
@@ -159,8 +766,6 @@ class MondayAttendanceBot:
         await update.message.reply_text(results_text, parse_mode='HTML')
 
     async def voters_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /voters для показа кто как голосовал"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
 
@@ -172,8 +777,6 @@ class MondayAttendanceBot:
         await update.message.reply_text(voters_text, parse_mode='HTML')
 
     async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Админ-панель"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
 
@@ -186,45 +789,97 @@ class MondayAttendanceBot:
 
         await update.message.reply_text(
             "⚙️ <b>Панель управления посещаемостью</b>\n\n"
-            f"Следующий понедельник: {self.get_next_monday_date()}\n"
-            f"Проголосовало: {len(self.votes)} человек",
+            f"📅 Следующий понедельник: {self.get_next_monday_date()}\n"
+            f"👥 Проголосовало: {len(self.votes)} человек\n\n"
+            f"💡 <i>Используйте кнопки для управления</i>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /status для проверки статуса бота"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
-
-        now = datetime.now()
-        next_monday = self.get_next_monday_date()
 
         status_text = (
             "🤖 <b>Статус бота:</b>\n\n"
             f"✅ <b>Бот активен</b>\n"
             f"📅 <b>Расписание:</b> Каждый понедельник в 19:00\n"
-            f"🕐 <b>Следующий понедельник:</b> {next_monday}\n"
+            f"🕐 <b>Следующий понедельник:</b> {self.get_next_monday_date()}\n"
             f"👥 <b>Текущие голоса:</b> {len(self.votes)}\n"
-            f"💾 <b>Данные:</b> Сохранены и загружены\n\n"
-            f"<i>Бот работает стабильно</i> 🚀"
+            f"🔇 <b>Авто-мут:</b> {'✅ ВКЛ' if self.mute_settings['enabled'] else '❌ ВЫКЛ'}\n\n"
+            f"💡 <i>Бот работает стабильно</i> 🚀"
         )
         await update.message.reply_text(status_text, parse_mode='HTML')
 
     async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает ID пользователя"""
         user = update.effective_user
         await update.message.reply_text(
-            f"🆔 Твой ID: <code>{user.id}</code>\n"
-            f"👤 Имя: {user.full_name}\n"
-            f"📛 Username: @{user.username if user.username else 'нет'}\n\n"
-            f"<i>Отправь этот ID создателю бота</i>",
+            f"🆔 <b>Ваш ID:</b> <code>{user.id}</code>\n"
+            f"👤 <b>Имя:</b> {user.full_name}\n"
+            f"📛 <b>Username:</b> @{user.username if user.username else 'нет'}\n\n"
+            f"💡 <i>Этот ID нужен для настройки прав доступа</i>",
             parse_mode='HTML'
         )
 
+    async def fuck_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        await update.message.reply_text(
+            f"🖕 {user.full_name}, пошёл нахуй! Не командуй тут, уёбок!\n\n"
+            f"💡 <i>Используйте нормальные команды, а не хамите</i>"
+        )
+
+    async def fix_rights_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_admin_access(update):
+            return
+
+        chat_id = update.effective_chat.id
+
+        try:
+            chat = await self.application.bot.get_chat(chat_id)
+            bot_member = await self.application.bot.get_chat_member(chat_id, self.application.bot.id)
+
+            rights_info = (
+                "🔧 <b>Проверка прав бота:</b>\n\n"
+                f"💬 <b>Чат:</b> {chat.title}\n"
+                f"🆔 <b>ID чата:</b> <code>{chat_id}</code>\n\n"
+                f"🤖 <b>Права бота:</b>\n"
+            )
+
+            if bot_member.status == 'administrator':
+                rights_info += "✅ <b>Статус:</b> Администратор\n"
+
+                if bot_member.can_restrict_members:
+                    rights_info += "✅ <b>Может ограничивать пользователей</b>\n"
+                else:
+                    rights_info += "❌ <b>НЕ может ограничивать пользователей</b>\n"
+
+                if bot_member.can_pin_messages:
+                    rights_info += "✅ <b>Может закреплять сообщения</b>\n"
+                else:
+                    rights_info += "❌ <b>НЕ может закреплять сообщения</b>\n"
+
+            else:
+                rights_info += "❌ <b>Статус:</b> НЕ администратор\n"
+
+            rights_info += "\n⚡ <b>Для полной работы нужно:</b>\n"
+            rights_info += "• Права администратора\n"
+            rights_info += "• Право 'Ограничивать пользователей'\n"
+            rights_info += "• Право 'Закреплять сообщения'\n\n"
+            rights_info += "💡 <i>Обратитесь к создателю чата для выдачи прав</i>"
+
+            await update.message.reply_text(rights_info, parse_mode='HTML')
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ <b>Ошибка проверки прав:</b>\n\n"
+                f"<code>{e}</code>\n\n"
+                f"💡 <i>Убедитесь что бот добавлен в группу и является администратором</i>",
+                parse_mode='HTML'
+            )
+
+    # ========== СИСТЕМНЫЕ МЕТОДЫ ==========
+
     async def create_monday_poll(self):
-        """Создаем голосование на понедельник"""
         if not self.chat_id:
             logger.warning("Чат не настроен")
             return
@@ -233,18 +888,17 @@ class MondayAttendanceBot:
             self.current_poll_id = str(int(datetime.now().timestamp()))
 
             message_text = (
-                f"<b>🗓️ Посещаемость на завтра</b>\n"
+                f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
                 f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
                 "❓ <b>Кто приходит?</b>\n\n"
                 "✅ <b>К 1</b> - приду к первому уроку\n"
                 "⏰ <b>Ко 2</b> - приду ко второму уроку\n"
                 "❌ <b>Не прихожу</b> - не буду\n\n"
-                "<i>Отметьтесь, пожалуйста, чтобы все были в курсе</i>"
+                "💡 <i>Отметьтесь, пожалуйста, чтобы все были в курсе</i>"
             )
 
             keyboard = await self.create_voting_keyboard()
 
-            # Отправляем сообщение
             message = await self.application.bot.send_message(
                 chat_id=self.chat_id,
                 text=message_text,
@@ -252,33 +906,42 @@ class MondayAttendanceBot:
                 parse_mode='HTML'
             )
 
-            # Открепляем старое сообщение если есть
-            if self.last_poll_message_id:
-                try:
-                    await self.application.bot.unpin_chat_message(
-                        chat_id=self.chat_id,
-                        message_id=self.last_poll_message_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Не удалось открепить: {e}")
+            try:
+                if self.last_poll_message_id:
+                    try:
+                        await self.application.bot.unpin_chat_message(
+                            chat_id=self.chat_id,
+                            message_id=self.last_poll_message_id
+                        )
+                    except:
+                        pass
 
-            # Закрепляем новое сообщение
-            await self.application.bot.pin_chat_message(
-                chat_id=self.chat_id,
-                message_id=message.message_id,
-                disable_notification=True
-            )
+                await self.application.bot.pin_chat_message(
+                    chat_id=self.chat_id,
+                    message_id=message.message_id,
+                    disable_notification=True
+                )
 
-            self.last_poll_message_id = message.message_id
+                self.last_poll_message_id = message.message_id
+                logger.info("✅ Сообщение закреплено")
+
+            except Exception as e:
+                logger.warning(f"❌ Не удалось закрепить: {e}")
+                await self.application.bot.send_message(
+                    chat_id=self.chat_id,
+                    text="⚠️ <b>Не могу закрепить сообщение!</b>\n\n"
+                         "💡 <i>Дайте боту права 'Закреплять сообщения'\n"
+                         "Используйте /fix_rights для проверки</i>",
+                    parse_mode='HTML'
+                )
+
             self.save_data()
-
             logger.info(f"✅ Новое голосование создано")
 
         except Exception as e:
             logger.error(f"❌ Ошибка создания голосования: {e}")
 
     async def create_voting_keyboard(self):
-        """Создаем клавиатуру для голосования"""
         votes_count = {'1': 0, '2': 0, '3': 0}
         for vote_data in self.votes.values():
             option = vote_data['option']
@@ -299,14 +962,12 @@ class MondayAttendanceBot:
             text = f"{emoji} {label} ({count} - {percentage:.1f}%)"
             keyboard.append([InlineKeyboardButton(text, callback_data=f"vote_{option}")])
 
-        # Кнопка для просмотра результатов (только для админа)
         if await self.is_admin(ADMIN_USER_ID):
             keyboard.append([InlineKeyboardButton("📊 Посмотреть результаты", callback_data="admin_full_stats")])
 
         return InlineKeyboardMarkup(keyboard)
 
     async def get_results_text(self):
-        """Текст с результатами голосования"""
         if not self.current_poll_id:
             return "Нет активного голосования"
 
@@ -317,7 +978,7 @@ class MondayAttendanceBot:
 
         total_votes = len(self.votes)
 
-        text = f"<b>📊 Посещаемость на завтра:</b>\n"
+        text = f"<b>📊 Посещаемость на следующий понедельник:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [
@@ -333,15 +994,13 @@ class MondayAttendanceBot:
             text += f"{label}: {bar} {count} ({percentage:.1f}%)\n"
 
         text += f"\n<b>Всего ответило:</b> {total_votes}"
-        text += f"\n\n<code>/voters</code> - посмотреть кто как голосовал"
+        text += f"\n\n💡 <i>Используйте /voters чтобы посмотреть кто как голосовал</i>"
         return text
 
     async def get_voters_text(self):
-        """Текст с информацией о голосовавших"""
         if not self.votes:
             return "Пока никто не отметился"
 
-        # Группируем голоса по вариантам
         votes_by_option = {
             '1': [],
             '2': [],
@@ -355,7 +1014,7 @@ class MondayAttendanceBot:
             display_name = f"{name} (@{username})" if username else name
             votes_by_option[option].append(display_name)
 
-        text = f"<b>👥 Кто приходит в завтра:</b>\n"
+        text = f"<b>👥 Кто приходит в следующий понедельник:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [
@@ -375,10 +1034,10 @@ class MondayAttendanceBot:
                 text += "—\n"
             text += "\n"
 
+        text += "💡 <i>Голосование обновляется в реальном времени</i>"
         return text
 
     async def get_full_stats_text(self):
-        """Полная статистика"""
         total_users = len(self.votes)
 
         text = f"<b>📈 Статистика посещаемости:</b>\n"
@@ -408,28 +1067,30 @@ class MondayAttendanceBot:
 
             voters = voters_by_option[option]
             if voters:
-                for voter in voters[:10]:  # Ограничиваем вывод
+                for voter in voters[:10]:
                     text += f"   👤 {voter}\n"
                 if len(voters) > 10:
                     text += f"   ... и еще {len(voters) - 10}\n"
             text += "\n"
 
+        text += "💡 <i>Используйте /admin для управления голосованием</i>"
         return text
 
     async def handle_vote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка голосования с обработкой ошибок"""
         query = update.callback_query
         user = query.from_user
 
         try:
-            # Проверяем, не устарел ли callback
-            if (datetime.now() - query.message.date).seconds > 120:
+            message_time = query.message.date.replace(tzinfo=timezone.utc)
+            current_time = datetime.now(timezone.utc)
+            time_diff = (current_time - message_time).seconds
+
+            if time_diff > 600:
                 await query.answer("❌ Голосование устарело", show_alert=True)
                 return
 
             option = query.data.split('_')[1]
 
-            # Сохраняем голос
             self.votes[str(user.id)] = {
                 'option': option,
                 'name': user.full_name,
@@ -437,9 +1098,16 @@ class MondayAttendanceBot:
                 'username': user.username
             }
 
-            # Обновляем клавиатуру
             keyboard = await self.create_voting_keyboard()
-            await query.edit_message_reply_markup(reply_markup=keyboard)
+
+            try:
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    # Сообщение не изменилось - это нормально
+                    pass
+                else:
+                    raise
 
             option_names = {'1': 'К 1', '2': 'Ко 2', '3': 'Не прихожу'}
             await query.answer(f"✅ {option_names[option]}")
@@ -449,7 +1117,6 @@ class MondayAttendanceBot:
 
         except BadRequest as e:
             if "not modified" in str(e).lower():
-                # Игнорируем ошибку "сообщение не изменено"
                 await query.answer()
             else:
                 logger.error(f"Ошибка BadRequest: {e}")
@@ -459,7 +1126,6 @@ class MondayAttendanceBot:
             await query.answer("❌ Ошибка, попробуйте снова")
 
     async def handle_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка админ-команд"""
         query = update.callback_query
         user = query.from_user
 
@@ -467,7 +1133,7 @@ class MondayAttendanceBot:
             try:
                 await query.answer("🚫 Ты кто такой? Пошёл нахуй!", show_alert=True)
             except:
-                pass  # Игнорируем ошибки ответа
+                pass
             return
 
         try:
@@ -479,13 +1145,25 @@ class MondayAttendanceBot:
 
             elif data == "admin_refresh":
                 keyboard = await self.create_voting_keyboard()
-                await query.edit_message_reply_markup(reply_markup=keyboard)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=keyboard)
+                except BadRequest as e:
+                    if "not modified" in str(e).lower():
+                        pass
+                    else:
+                        raise
                 await query.answer("✅ Голосование обновлено!")
 
             elif data == "admin_clear":
                 self.votes = {}
                 keyboard = await self.create_voting_keyboard()
-                await query.edit_message_reply_markup(reply_markup=keyboard)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=keyboard)
+                except BadRequest as e:
+                    if "not modified" in str(e).lower():
+                        pass
+                    else:
+                        raise
                 await query.answer("✅ Все голоса очищены!")
                 self.save_data()
 
@@ -503,25 +1181,21 @@ class MondayAttendanceBot:
                 pass
 
     async def check_schedule(self):
-        """Проверяем расписание"""
         while True:
             try:
                 now = datetime.now()
-                # Каждый понедельник в 19:00
                 if now.weekday() == 0 and now.hour == 19 and now.minute == 0:
                     logger.info("Создаем новое голосование по расписанию!")
                     await self.create_monday_poll()
-                    # Ждем 61 минуту чтобы не создавать повторно
                     await asyncio.sleep(61)
                 else:
-                    await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+                    await asyncio.sleep(30)
 
             except Exception as e:
                 logger.error(f"Ошибка в планировщике: {e}")
                 await asyncio.sleep(60)
 
     async def run(self):
-        """Запуск бота"""
         self.load_data()
 
         await self.application.initialize()
@@ -530,12 +1204,10 @@ class MondayAttendanceBot:
 
         logger.info("🤖 Бот запущен!")
 
-        # Создаем голосование если его нет
         if not self.current_poll_id and self.chat_id:
             logger.info("Создаем первое голосование...")
             await self.create_monday_poll()
 
-        # Запускаем планировщик
         await self.check_schedule()
 
 
@@ -544,6 +1216,7 @@ if __name__ == "__main__":
     print(f"📅 Расписание: каждый понедельник в 19:00")
     print("🤖 Токен бота: 8455558290:AAHDiNfqtG7LMOWor9rHhpwtCVv-JHmt-7c")
     print(f"👑 Админ ID: {ADMIN_USER_ID}")
+    print("💡 Используйте /help для списка команд")
 
     bot = MondayAttendanceBot(BOT_TOKEN)
 
