@@ -2,6 +2,7 @@ import asyncio
 import logging
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import BadRequest, TimedOut
 import time
 import json
 import os
@@ -14,12 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ⚠️ ВАЖНО: Используйте переменную окружения для безопасности!
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8455558290:AAHDiNfqtG7LMOWor9rHhpwtCVv-JHmt-7c')
-
-# ⚡ НАСТРОЙТЕ СВОЙ USER ID ЗДЕСЬ ⚡
-# Чтобы получить свой ID: отправьте /id боту @userinfobot
-ADMIN_USER_ID = 2073879359  # ЗАМЕНИТЕ НА ВАШ REAL USER ID
+ADMIN_USER_ID = 2073879359  # Ваш ID
 
 
 class MondayAttendanceBot:
@@ -28,7 +25,7 @@ class MondayAttendanceBot:
         self.chat_id = None
         self.last_poll_message_id = None
         self.current_poll_id = None
-        self.votes = {}  # {user_id: {'option': option, 'name': name, 'timestamp': timestamp}}
+        self.votes = {}
         self.application = Application.builder().token(token).build()
 
         # Обработчики команд
@@ -38,21 +35,63 @@ class MondayAttendanceBot:
         self.application.add_handler(CommandHandler("voters", self.voters_command))
         self.application.add_handler(CommandHandler("admin", self.admin_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("id", self.id_command))  # Новоя команда для получения ID
+        self.application.add_handler(CommandHandler("id", self.id_command))
+        self.application.add_handler(CommandHandler("fuck", self.fuck_command))
 
-        # Обработчики callback'ов (работают для всех)
+        # Обработчики callback'ов
         self.application.add_handler(CallbackQueryHandler(self.handle_vote, pattern="^vote_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_admin, pattern="^admin_"))
 
-        # Обработчик для всех сообщений (отправляет всех нахуй)
-        self.application.add_handler(CommandHandler("fuck", self.fuck_command))
+    def save_data(self):
+        """Сохраняем данные голосования с обработкой кодировки"""
+        try:
+            data = {
+                'chat_id': self.chat_id,
+                'last_poll_message_id': self.last_poll_message_id,
+                'current_poll_id': self.current_poll_id,
+                'votes': self.votes,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open('attendance_data.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, default=str, indent=2)
+            logger.info("Данные сохранены")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения данных: {e}")
+
+    def load_data(self):
+        """Загружаем данные голосования с обработкой ошибок"""
+        try:
+            if os.path.exists('attendance_data.json'):
+                with open('attendance_data.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.chat_id = data.get('chat_id')
+                    self.last_poll_message_id = data.get('last_poll_message_id')
+                    self.current_poll_id = data.get('current_poll_id')
+                    self.votes = data.get('votes', {})
+                    logger.info("Данные загружены")
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка JSON: {e}. Создаем новые данные.")
+            # Создаем backup поврежденного файла
+            if os.path.exists('attendance_data.json'):
+                os.rename('attendance_data.json', f'attendance_data_backup_{int(time.time())}.json')
+            self.votes = {}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки данных: {e}")
+            self.votes = {}
+
+    def get_next_monday_date(self):
+        """Получаем дату следующего понедельника"""
+        today = datetime.now()
+        days_ahead = 0 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        next_monday = today + timedelta(days=days_ahead)
+        return next_monday.strftime('%d.%m.%Y')
 
     async def is_admin(self, user_id):
-        """Проверяем, является ли пользователь администратором"""
         return user_id == ADMIN_USER_ID
 
     async def check_admin_access(self, update: Update):
-        """Проверяет доступ и отправляет сообщение если не админ"""
         user_id = update.effective_user.id
         if not await self.is_admin(user_id):
             await update.message.reply_text("🚫 Пошёл нахуй, петушара! Ты кто такой чтобы мне команды раздавать?")
@@ -66,109 +105,32 @@ class MondayAttendanceBot:
             f"🖕 {user.full_name}, пошёл нахуй! Не командуй тут, уёбок!"
         )
 
-    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает ID пользователя"""
-        user = update.effective_user
-        await update.message.reply_text(
-            f"🆔 Твой ID: <code>{user.id}</code>\n"
-            f"👤 Имя: {user.full_name}\n"
-            f"📛 Username: @{user.username if user.username else 'нет'}\n\n"
-            f"<i>Отправь этот ID создателю бота</i>",
-            parse_mode='HTML'
-        )
-
-    def save_data(self):
-        """Сохраняем данные голосования"""
-        try:
-            data = {
-                'chat_id': self.chat_id,
-                'last_poll_message_id': self.last_poll_message_id,
-                'current_poll_id': self.current_poll_id,
-                'votes': self.votes,
-                'last_updated': datetime.now().isoformat()
-            }
-            with open('attendance_data.json', 'w') as f:
-                json.dump(data, f, ensure_ascii=False, default=str)
-            logger.info("Данные сохранены")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения данных: {e}")
-
-    def load_data(self):
-        """Загружаем данные голосования"""
-        try:
-            if os.path.exists('attendance_data.json'):
-                with open('attendance_data.json', 'r') as f:
-                    data = json.load(f)
-                    self.chat_id = data.get('chat_id')
-                    self.last_poll_message_id = data.get('last_poll_message_id')
-                    self.current_poll_id = data.get('current_poll_id')
-                    self.votes = data.get('votes', {})
-                    last_updated = data.get('last_updated')
-                    logger.info(f"Данные загружены (обновлены: {last_updated})")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки данных: {e}")
-
-    def get_next_monday_date(self):
-        """Получаем дату следующего понедельника"""
-        today = datetime.now()
-        days_ahead = 0 - today.weekday()  # 0 = Monday
-        if days_ahead <= 0:  # Target day already happened this week
-            days_ahead += 7
-        next_monday = today + timedelta(days=days_ahead)
-        return next_monday.strftime('%d.%m.%Y')
-
-    def get_next_monday_weekday(self):
-        """Получаем день недели следующего понедельника"""
-        return "Понедельник"
-
-    def should_create_new_poll(self):
-        """Проверяем, нужно ли создавать новое голосование"""
-        # Создаем новое голосование каждый понедельник в 19:00
-        now = datetime.now()
-
-        # Если сейчас понедельник и время после 19:00
-        if now.weekday() == 0 and now.hour >= 19:
-            # Проверяем, создавали ли мы уже голосование на этой неделе
-            if not self.current_poll_id:
-                return True
-
-            # Проверяем дату создания текущего голосования
-            try:
-                poll_timestamp = int(self.current_poll_id)
-                poll_date = datetime.fromtimestamp(poll_timestamp)
-                # Если голосование создано до сегодняшнего дня, создаем новое
-                if poll_date.date() < now.date():
-                    return True
-            except:
-                return True
-
-        return False
-
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /start для настройки бота"""
-        # Проверяем доступ
         if not await self.check_admin_access(update):
             return
 
         self.chat_id = update.effective_chat.id
         user = update.effective_user
 
-        logger.info(f"Бот активирован в чате {self.chat_id} пользователем {user.full_name}")
+        logger.info(f"Бот активирован в чате {self.chat_id}")
 
         await update.message.reply_text(
             "✅ <b>Бот для учета посещаемости активирован!</b>\n\n"
-            "📅 <b>Каждый понедельник в 19:00</b> я буду создавать новое голосование "
-            "на следующий понедельник.\n\n"
+            "📅 <b>Каждый понедельник в 19:00</b> я буду создавать новое голосование.\n\n"
             "📋 <b>Команды:</b>\n"
             "/attendance - текущее голосование\n"
             "/results - результаты\n"
             "/voters - кто как голосовал\n"
             "/admin - управление\n"
-            "/status - статус бота\n\n"
+            "/status - статус бота\n"
+            "/fuck - отправить нахуй\n\n"
             "<i>Просто нажмите на кнопку в закрепленном сообщении чтобы отметить свое присутствие</i>",
             parse_mode='HTML'
         )
         self.save_data()
+
+        # Создаем голосование после активации
+        await self.create_monday_poll()
 
     async def attendance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /attendance для быстрого голосования"""
@@ -250,89 +212,73 @@ class MondayAttendanceBot:
         )
         await update.message.reply_text(status_text, parse_mode='HTML')
 
-    async def handle_vote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка голосования (доступно всем)"""
-        query = update.callback_query
-        user = query.from_user
-        data = query.data
+    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает ID пользователя"""
+        user = update.effective_user
+        await update.message.reply_text(
+            f"🆔 Твой ID: <code>{user.id}</code>\n"
+            f"👤 Имя: {user.full_name}\n"
+            f"📛 Username: @{user.username if user.username else 'нет'}\n\n"
+            f"<i>Отправь этот ID создателю бота</i>",
+            parse_mode='HTML'
+        )
 
-        # Разбираем callback_data: vote_option
-        option = data.split('_')[1]
-
-        # Сохраняем голос
-        self.votes[str(user.id)] = {
-            'option': option,
-            'name': user.full_name,
-            'timestamp': datetime.now().isoformat(),
-            'username': user.username
-        }
-
-        # Обновляем клавиатуру
-        keyboard = await self.create_voting_keyboard()
-        await query.edit_message_reply_markup(reply_markup=keyboard)
-
-        await query.answer(f"✅ {self.get_option_name(option)}")
-        self.save_data()
-
-        logger.info(f"Пользователь {user.full_name} проголосовал: {self.get_option_name(option)}")
-
-    async def handle_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка админ-команд (только для админа)"""
-        query = update.callback_query
-        user = query.from_user
-
-        # Проверяем доступ для админ-команд
-        if not await self.is_admin(user.id):
-            await query.answer("🚫 Ты кто такой? Пошёл нахуй!", show_alert=True)
+    async def create_monday_poll(self):
+        """Создаем голосование на понедельник"""
+        if not self.chat_id:
+            logger.warning("Чат не настроен")
             return
 
-        data = query.data
+        try:
+            self.current_poll_id = str(int(datetime.now().timestamp()))
 
-        logger.info(f"Админ команда от {user.full_name}: {data}")
+            message_text = (
+                f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
+                f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
+                "❓ <b>Кто приходит?</b>\n\n"
+                "✅ <b>К 1</b> - приду к первому уроку\n"
+                "⏰ <b>Ко 2</b> - приду ко второму уроку\n"
+                "❌ <b>Не прихожу</b> - не буду\n\n"
+                "<i>Отметьтесь, пожалуйста, чтобы все были в курсе</i>"
+            )
 
-        if data == "admin_full_stats":
-            stats_text = await self.get_full_stats_text()
-            await query.message.reply_text(stats_text, parse_mode='HTML')
-
-        elif data == "admin_refresh":
             keyboard = await self.create_voting_keyboard()
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            await query.answer("✅ Голосование обновлено!")
 
-        elif data == "admin_clear":
-            self.votes = {}
-            keyboard = await self.create_voting_keyboard()
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            await query.answer("✅ Все голоса очищены!")
+            # Отправляем сообщение
+            message = await self.application.bot.send_message(
+                chat_id=self.chat_id,
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+
+            # Открепляем старое сообщение если есть
+            if self.last_poll_message_id:
+                try:
+                    await self.application.bot.unpin_chat_message(
+                        chat_id=self.chat_id,
+                        message_id=self.last_poll_message_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось открепить: {e}")
+
+            # Закрепляем новое сообщение
+            await self.application.bot.pin_chat_message(
+                chat_id=self.chat_id,
+                message_id=message.message_id,
+                disable_notification=True
+            )
+
+            self.last_poll_message_id = message.message_id
             self.save_data()
 
-        elif data == "admin_create_now":
-            await self.create_monday_poll()
-            await query.answer("✅ Голосование создано!")
+            logger.info(f"✅ Новое голосование создано")
 
-        await query.answer()
-
-    def get_option_name(self, option):
-        """Названия вариантов ответа"""
-        options = {
-            '1': '✅ К 1',
-            '2': '⏰ Ко 2',
-            '3': '❌ Не прихожу'
-        }
-        return options.get(option, option)
-
-    def get_option_emoji(self, option):
-        """Эмодзи для вариантов"""
-        options = {
-            '1': '✅',
-            '2': '⏰',
-            '3': '❌'
-        }
-        return options.get(option, '')
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания голосования: {e}")
 
     async def create_voting_keyboard(self):
         """Создаем клавиатуру для голосования"""
-        # Считаем голоса для каждого варианта
         votes_count = {'1': 0, '2': 0, '3': 0}
         for vote_data in self.votes.values():
             option = vote_data['option']
@@ -342,21 +288,20 @@ class MondayAttendanceBot:
 
         keyboard = []
         options = [
-            ('1', 'К 1'),
-            ('2', 'Ко 2'),
-            ('3', 'Не прихожу')
+            ('1', 'К 1', '✅'),
+            ('2', 'Ко 2', '⏰'),
+            ('3', 'Не прихожу', '❌')
         ]
 
-        for option, label in options:
+        for option, label, emoji in options:
             count = votes_count[option]
             percentage = (count / total_votes * 100) if total_votes > 0 else 0
-            emoji = self.get_option_emoji(option)
             text = f"{emoji} {label} ({count} - {percentage:.1f}%)"
             keyboard.append([InlineKeyboardButton(text, callback_data=f"vote_{option}")])
 
-        # Добавляем кнопку для просмотра результатов (только для админа)
+        # Кнопка для просмотра результатов (только для админа)
         if await self.is_admin(ADMIN_USER_ID):
-            keyboard.append([InlineKeyboardButton("👁️ Посмотреть кто идет", callback_data="admin_full_stats")])
+            keyboard.append([InlineKeyboardButton("📊 Посмотреть результаты", callback_data="admin_full_stats")])
 
         return InlineKeyboardMarkup(keyboard)
 
@@ -433,23 +378,20 @@ class MondayAttendanceBot:
         return text
 
     async def get_full_stats_text(self):
-        """Полная статистика для админа"""
+        """Полная статистика"""
         total_users = len(self.votes)
 
         text = f"<b>📈 Статистика посещаемости:</b>\n"
-        text += f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
+        text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
-        # Подсчет по вариантам
         votes_count = {'1': 0, '2': 0, '3': 0}
         voters_by_option = {'1': [], '2': [], '3': []}
 
         for vote_data in self.votes.values():
             option = vote_data['option']
             name = vote_data['name']
-            username = vote_data.get('username')
-            display_name = f"{name} (@{username})" if username else name
             votes_count[option] += 1
-            voters_by_option[option].append(display_name)
+            voters_by_option[option].append(name)
 
         text += f"<b>Всего отметилось:</b> {total_users}\n\n"
 
@@ -466,93 +408,113 @@ class MondayAttendanceBot:
 
             voters = voters_by_option[option]
             if voters:
-                for voter in voters:
+                for voter in voters[:10]:  # Ограничиваем вывод
                     text += f"   👤 {voter}\n"
+                if len(voters) > 10:
+                    text += f"   ... и еще {len(voters) - 10}\n"
             text += "\n"
 
         return text
 
-    async def create_monday_poll(self):
-        """Создаем голосование на понедельник"""
-        if not self.chat_id:
-            logger.warning("Чат не настроен. Отправьте /start в группе")
+    async def handle_vote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка голосования с обработкой ошибок"""
+        query = update.callback_query
+        user = query.from_user
+
+        try:
+            # Проверяем, не устарел ли callback
+            if (datetime.now() - query.message.date).seconds > 120:
+                await query.answer("❌ Голосование устарело", show_alert=True)
+                return
+
+            option = query.data.split('_')[1]
+
+            # Сохраняем голос
+            self.votes[str(user.id)] = {
+                'option': option,
+                'name': user.full_name,
+                'timestamp': datetime.now().isoformat(),
+                'username': user.username
+            }
+
+            # Обновляем клавиатуру
+            keyboard = await self.create_voting_keyboard()
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+
+            option_names = {'1': 'К 1', '2': 'Ко 2', '3': 'Не прихожу'}
+            await query.answer(f"✅ {option_names[option]}")
+            self.save_data()
+
+            logger.info(f"Пользователь {user.full_name} проголосовал")
+
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                # Игнорируем ошибку "сообщение не изменено"
+                await query.answer()
+            else:
+                logger.error(f"Ошибка BadRequest: {e}")
+                await query.answer("❌ Ошибка, попробуйте снова")
+        except Exception as e:
+            logger.error(f"Ошибка голосования: {e}")
+            await query.answer("❌ Ошибка, попробуйте снова")
+
+    async def handle_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка админ-команд"""
+        query = update.callback_query
+        user = query.from_user
+
+        if not await self.is_admin(user.id):
+            try:
+                await query.answer("🚫 Ты кто такой? Пошёл нахуй!", show_alert=True)
+            except:
+                pass  # Игнорируем ошибки ответа
             return
 
         try:
-            # Создаем новый ID для голосования
-            self.current_poll_id = str(int(datetime.now().timestamp()))
+            data = query.data
 
-            # Очищаем голоса для новой недели
-            self.votes = {}
+            if data == "admin_full_stats":
+                stats_text = await self.get_full_stats_text()
+                await query.message.reply_text(stats_text, parse_mode='HTML')
 
-            # Текст сообщения
-            message_text = (
-                f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
-                f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
-                "❓ <b>Кто приходит?</b>\n\n"
-                "✅ <b>К 1</b> - приду к первому уроку\n"
-                "⏰ <b>Ко 2</b> - приду ко второму уроку\n"
-                "❌ <b>Не прихожу</b> - не буду\n\n"
-                "<i>Отметьтесь, пожалуйста, чтобы все были в курсе</i>\n\n"
-                "<code>/attendance</code> - обновить голосование\n"
-                "<code>/results</code> - результаты\n"
-                "<code>/voters</code> - список участников"
-            )
+            elif data == "admin_refresh":
+                keyboard = await self.create_voting_keyboard()
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                await query.answer("✅ Голосование обновлено!")
 
-            # Создаем клавиатуру
-            keyboard = await self.create_voting_keyboard()
+            elif data == "admin_clear":
+                self.votes = {}
+                keyboard = await self.create_voting_keyboard()
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+                await query.answer("✅ Все голоса очищены!")
+                self.save_data()
 
-            # Отправляем сообщение
-            message = await self.application.bot.send_message(
-                chat_id=self.chat_id,
-                text=message_text,
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
+            elif data == "admin_create_now":
+                await self.create_monday_poll()
+                await query.answer("✅ Голосование создано!")
 
-            # Открепляем старое сообщение если есть
-            if self.last_poll_message_id:
-                try:
-                    await self.application.bot.unpin_chat_message(
-                        chat_id=self.chat_id,
-                        message_id=self.last_poll_message_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Не удалось открепить старое сообщение: {e}")
-
-            # Закрепляем новое сообщение
-            await self.application.bot.pin_chat_message(
-                chat_id=self.chat_id,
-                message_id=message.message_id,
-                disable_notification=True
-            )
-
-            self.last_poll_message_id = message.message_id
-            self.save_data()
-
-            logger.info(f"✅ Новое голосование создано на {self.get_next_monday_date()}")
-
-            # Отправляем уведомление
-            await self.application.bot.send_message(
-                chat_id=self.chat_id,
-                text="🔄 <b>Создано новое голосование на следующий понедельник!</b>\n"
-                     "Отметьтесь в закрепленном сообщении 📍",
-                parse_mode='HTML'
-            )
+            await query.answer()
 
         except Exception as e:
-            logger.error(f"❌ Ошибка создания голосования: {e}")
+            logger.error(f"Ошибка админ-команды: {e}")
+            try:
+                await query.answer("❌ Ошибка")
+            except:
+                pass
 
     async def check_schedule(self):
-        """Проверяем расписание и создаем голосование если нужно"""
+        """Проверяем расписание"""
         while True:
             try:
-                if self.should_create_new_poll():
-                    logger.info("Время создавать новое голосование!")
+                now = datetime.now()
+                # Каждый понедельник в 19:00
+                if now.weekday() == 0 and now.hour == 19 and now.minute == 0:
+                    logger.info("Создаем новое голосование по расписанию!")
                     await self.create_monday_poll()
-
-                # Ждем 1 минуту перед следующей проверкой
-                await asyncio.sleep(60)
+                    # Ждем 61 минуту чтобы не создавать повторно
+                    await asyncio.sleep(61)
+                else:
+                    await asyncio.sleep(30)  # Проверяем каждые 30 секунд
 
             except Exception as e:
                 logger.error(f"Ошибка в планировщике: {e}")
@@ -560,49 +522,28 @@ class MondayAttendanceBot:
 
     async def run(self):
         """Запуск бота"""
-        # Загружаем данные
         self.load_data()
 
-        # Инициализируем бота
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
 
-        logger.info("🤖 Бот для учета посещаемости запущен!")
-        logger.info("⏰ Расписание настроено: каждый понедельник в 19:00")
-        logger.info(f"👑 Админ бота: {ADMIN_USER_ID}")
+        logger.info("🤖 Бот запущен!")
 
-        # Создаем голосование при запуске, если его нет
-        if not self.current_poll_id:
+        # Создаем голосование если его нет
+        if not self.current_poll_id and self.chat_id:
             logger.info("Создаем первое голосование...")
             await self.create_monday_poll()
-        else:
-            logger.info("Голосование уже активно, обновляем клавиатуру...")
-            # Обновляем сообщение если оно есть
-            if self.last_poll_message_id and self.chat_id:
-                try:
-                    keyboard = await self.create_voting_keyboard()
-                    await self.application.bot.edit_message_reply_markup(
-                        chat_id=self.chat_id,
-                        message_id=self.last_poll_message_id,
-                        reply_markup=keyboard
-                    )
-                except Exception as e:
-                    logger.warning(f"Не удалось обновить сообщение: {e}")
-
-        logger.info("✅ Бот готов к работе!")
 
         # Запускаем планировщик
         await self.check_schedule()
 
 
-# Запуск бота
 if __name__ == "__main__":
     print("🚀 Запуск бота для учета посещаемости...")
     print(f"📅 Расписание: каждый понедельник в 19:00")
     print("🤖 Токен бота: 8455558290:AAHDiNfqtG7LMOWor9rHhpwtCVv-JHmt-7c")
     print(f"👑 Админ ID: {ADMIN_USER_ID}")
-    print("⚠️  ВАЖНО: Замени ADMIN_USER_ID на свой реальный ID!")
 
     bot = MondayAttendanceBot(BOT_TOKEN)
 
