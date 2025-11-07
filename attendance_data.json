@@ -5,8 +5,8 @@
   "votes": {},
   "mute_settings": {
     "enabled": true,
-    "duration": 300,
+    "duration": 3600,
     "reply_to_mute": true
   },
-  "last_updated": "2025-11-07T23:50:40.211303"
+  "last_updated": "2025-11-08T00:05:48.153958"
 }
