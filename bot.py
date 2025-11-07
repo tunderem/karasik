@@ -233,7 +233,7 @@ class MondayAttendanceBot:
             self.current_poll_id = str(int(datetime.now().timestamp()))
 
             message_text = (
-                f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
+                f"<b>🗓️ Посещаемость на завтра</b>\n"
                 f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
                 "❓ <b>Кто приходит?</b>\n\n"
                 "✅ <b>К 1</b> - приду к первому уроку\n"
@@ -317,7 +317,7 @@ class MondayAttendanceBot:
 
         total_votes = len(self.votes)
 
-        text = f"<b>📊 Посещаемость на следующий понедельник:</b>\n"
+        text = f"<b>📊 Посещаемость на завтра:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [
@@ -355,7 +355,7 @@ class MondayAttendanceBot:
             display_name = f"{name} (@{username})" if username else name
             votes_by_option[option].append(display_name)
 
-        text = f"<b>👥 Кто приходит в следующий понедельник:</b>\n"
+        text = f"<b>👥 Кто приходит в завтра:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [
