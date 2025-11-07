@@ -45,6 +45,7 @@ class MondayAttendanceBot:
         self.application.add_handler(CommandHandler("fuck", self.fuck_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("fix_rights", self.fix_rights_command))
+        self.application.add_handler(CommandHandler("find", self.find_user_command))
 
         # Команды управления доступом
         self.application.add_handler(CommandHandler("access", self.access_command))
@@ -209,7 +210,15 @@ class MondayAttendanceBot:
             user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
             if not user_id:
-                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                await update.message.reply_text(
+                    f"❌ <b>Пользователь '{target}' не найден</b>\n\n"
+                    f"💡 <i>Проверьте:\n"
+                    f"• Правильность написания username\n"
+                    f"• Что пользователь есть в этом чате\n"
+                    f"• Что ID пользователя верный</i>\n\n"
+                    f"🔍 <b>Совет:</b> Используйте команду /id чтобы узнать ID пользователя",
+                    parse_mode='HTML'
+                )
                 return
 
             # Проверяем, не добавлен ли уже пользователь
@@ -259,7 +268,11 @@ class MondayAttendanceBot:
             user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
             if not user_id:
-                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                await update.message.reply_text(
+                    f"❌ <b>Пользователь '{target}' не найден</b>\n\n"
+                    f"💡 <i>Проверьте правильность введенных данных</i>",
+                    parse_mode='HTML'
+                )
                 return
 
             # Проверяем, не пытаемся ли удалить администратора
@@ -430,9 +443,6 @@ class MondayAttendanceBot:
                 "❌ <b>Использование:</b>\n"
                 "<code>/mute @username</code> - замутить на время по умолчанию\n"
                 "<code>/mute @username 10m</code> - замутить на 10 минут\n"
-                "<code>/mute @username 1h</code> - замутить на 1 час\n"
-                "<code>/mute @username 1d</code> - замутить на 1 день\n"
-                "<code>/mute @username 1w</code> - замутить на 1 неделю\n"
                 "<code>/mute 123456789</code> - замутить по ID\n\n"
                 "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>",
                 parse_mode='HTML'
@@ -454,7 +464,15 @@ class MondayAttendanceBot:
             user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
             if not user_id:
-                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                await update.message.reply_text(
+                    f"❌ <b>Пользователь '{target}' не найден</b>\n\n"
+                    f"💡 <i>Проверьте:\n"
+                    f"• Правильность написания username\n"
+                    f"• Что пользователь есть в этом чате\n"
+                    f"• Что ID пользователя верный</i>\n\n"
+                    f"🔍 <b>Совет:</b> Используйте команду /id чтобы узнать ID пользователя",
+                    parse_mode='HTML'
+                )
                 return
 
             # Проверяем, не пытаемся ли замутить бота или администратора
@@ -523,7 +541,11 @@ class MondayAttendanceBot:
             user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
             if not user_id:
-                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                await update.message.reply_text(
+                    f"❌ <b>Пользователь '{target}' не найден</b>\n\n"
+                    f"💡 <i>Проверьте правильность введенных данных</i>",
+                    parse_mode='HTML'
+                )
                 return
 
             # Выполняем размут
@@ -552,37 +574,80 @@ class MondayAttendanceBot:
         """Находит пользователя в чате по username, ID или имени"""
         target = target.lstrip('@')  # Убираем @ если есть
 
-        # Пробуем как ID
+        # Сценарий 1: target - это числовой ID
+        if target.isdigit():
+            try:
+                user_id = int(target)
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                return user_id, member.user.full_name
+            except (ValueError, BadRequest):
+                pass
+
+        # Сценарий 2: target - это username
         try:
-            user_id = int(target)
-            member = await context.bot.get_chat_member(chat_id, user_id)
-            return user_id, member.user.full_name
-        except (ValueError, BadRequest):
-            pass  # Это не ID или пользователь не найден
+            # Пробуем получить пользователя по username
+            user = await context.bot.get_chat(f"@{target}")
+            # Проверяем, что пользователь в чате
+            member = await context.bot.get_chat_member(chat_id, user.id)
+            return user.id, user.full_name
+        except BadRequest:
+            pass
 
-        # Ищем по username или имени среди участников чата
+        # Сценарий 3: Ищем среди администраторов чата по имени
         try:
-            # Используем get_chat_administrators для получения списка пользователей
-            members = await context.bot.get_chat_administrators(chat_id)
-            for member in members:
-                user = member.user
+            admins = await context.bot.get_chat_administrators(chat_id)
+            for admin in admins:
+                user = admin.user
 
-                # Проверяем username
-                if user.username and user.username.lower() == target.lower():
-                    return user.id, user.full_name
-
-                # Проверяем полное имя
+                # Точное совпадение имени
                 if user.full_name.lower() == target.lower():
                     return user.id, user.full_name
 
-                # Проверяем частичное совпадение имени
+                # Частичное совпадение имени
                 if target.lower() in user.full_name.lower():
                     return user.id, user.full_name
 
+                # Совпадение username (без @)
+                if user.username and user.username.lower() == target.lower():
+                    return user.id, user.full_name
         except Exception as e:
-            logger.error(f"Ошибка поиска пользователя: {e}")
+            logger.error(f"Ошибка поиска среди администраторов: {e}")
 
         return None, None
+
+    async def find_user_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для поиска пользователя (отладка)"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text("❌ Укажите username или ID пользователя")
+            return
+
+        target = context.args[0]
+
+        try:
+            user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
+
+            if user_id:
+                await update.message.reply_text(
+                    f"✅ <b>Пользователь найден:</b>\n\n"
+                    f"👤 <b>Имя:</b> {user_name}\n"
+                    f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+                    f"🔍 <b>Запрос:</b> {target}",
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ <b>Пользователь '{target}' не найден</b>\n\n"
+                    f"💡 <i>Попробуйте:\n"
+                    f"• Указать точный username (без @)\n"
+                    f"• Использовать числовой ID\n"
+                    f"• Убедиться, что пользователь в чате</i>",
+                    parse_mode='HTML'
+                )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка поиска: {e}")
 
     async def mute_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список замьюченных пользователей"""
@@ -909,7 +974,8 @@ class MondayAttendanceBot:
             "🎯 <b>Другие команды:</b>\n"
             "<code>/id</code> - узнать свой ID\n"
             "<code>/fuck</code> - отправить нахуй\n"
-            "<code>/help</code> - эта справка\n\n"
+            "<code>/help</code> - эта справка\n"
+            "<code>/find</code> - найти пользователя (админ)\n\n"
 
             "⚡ <b>Быстрые действия:</b>\n"
             "• Ответьте <code>/mute</code> на сообщение для мута\n"

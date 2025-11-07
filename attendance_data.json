@@ -1,7 +1,7 @@
 {
   "chat_id": -1003205745038,
-  "last_poll_message_id": 130,
-  "current_poll_id": "1762551170",
+  "last_poll_message_id": 163,
+  "current_poll_id": "1762552448",
   "votes": {
     "5141893293": {
       "option": "1",
@@ -15,5 +15,8 @@
     "duration": 3600,
     "reply_to_mute": true
   },
-  "last_updated": "2025-11-08T00:32:53.793035"
+  "allowed_users": [
+    2073879359
+  ],
+  "last_updated": "2025-11-08T00:54:08.832678"
 }
