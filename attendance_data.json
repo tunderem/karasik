@@ -1,7 +1,7 @@
 {
   "chat_id": -1003205745038,
-  "last_poll_message_id": 163,
-  "current_poll_id": "1762552448",
+  "last_poll_message_id": 191,
+  "current_poll_id": "1762554625",
   "votes": {
     "5141893293": {
       "option": "1",
@@ -10,13 +10,5 @@
       "username": "ilkogys"
     }
   },
-  "mute_settings": {
-    "enabled": true,
-    "duration": 3600,
-    "reply_to_mute": true
-  },
-  "allowed_users": [
-    2073879359
-  ],
-  "last_updated": "2025-11-08T00:54:08.832678"
+  "last_updated": "2025-11-08T01:30:25.936754"
 }

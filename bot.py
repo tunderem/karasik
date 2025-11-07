@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8455558290:AAHDiNfqtG7LMOWor9rHhpwtCVv-JHmt-7c')
-ADMIN_USER_ID = 2073879359  # Ваш ID
+MAIN_ADMIN_ID = 2073879359  # Главный администратор (нельзя удалить)
 
 
 class SimpleAttendanceBot:
@@ -26,6 +26,7 @@ class SimpleAttendanceBot:
         self.last_poll_message_id = None
         self.current_poll_id = None
         self.votes = {}
+        self.admin_users = [MAIN_ADMIN_ID]  # Список администраторов
         self.application = Application.builder().token(token).build()
 
         # Обработчики команд
@@ -38,11 +39,16 @@ class SimpleAttendanceBot:
         self.application.add_handler(CommandHandler("id", self.id_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("fix_rights", self.fix_rights_command))
+        self.application.add_handler(CommandHandler("get_id", self.get_id_command))
 
         # Команды для получения ID
-        self.application.add_handler(CommandHandler("get_id", self.get_id_command))
         self.application.add_handler(CommandHandler("all_ids", self.all_ids_command))
         self.application.add_handler(CommandHandler("chat_info", self.chat_info_command))
+
+        # Команды управления администраторами
+        self.application.add_handler(CommandHandler("admins", self.admins_command))
+        self.application.add_handler(CommandHandler("add_admin", self.add_admin_command))
+        self.application.add_handler(CommandHandler("remove_admin", self.remove_admin_command))
 
         # Команды мута
         self.application.add_handler(CommandHandler("mute", self.mute_command))
@@ -60,13 +66,14 @@ class SimpleAttendanceBot:
             MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/unmute\b'), self.handle_reply_unmute))
 
     def save_data(self):
-        """Сохраняем данные голосования"""
+        """Сохраняем данные"""
         try:
             data = {
                 'chat_id': self.chat_id,
                 'last_poll_message_id': self.last_poll_message_id,
                 'current_poll_id': self.current_poll_id,
                 'votes': self.votes,
+                'admin_users': self.admin_users,
                 'last_updated': datetime.now().isoformat()
             }
             with open('attendance_data.json', 'w', encoding='utf-8') as f:
@@ -75,7 +82,7 @@ class SimpleAttendanceBot:
             logger.error(f"Ошибка сохранения: {e}")
 
     def load_data(self):
-        """Загружаем данные голосования"""
+        """Загружаем данные"""
         try:
             if os.path.exists('attendance_data.json'):
                 with open('attendance_data.json', 'r', encoding='utf-8') as f:
@@ -84,9 +91,15 @@ class SimpleAttendanceBot:
                     self.last_poll_message_id = data.get('last_poll_message_id')
                     self.current_poll_id = data.get('current_poll_id')
                     self.votes = data.get('votes', {})
+                    self.admin_users = data.get('admin_users', [MAIN_ADMIN_ID])
+
+                    # Гарантируем, что главный админ всегда в списке
+                    if MAIN_ADMIN_ID not in self.admin_users:
+                        self.admin_users.append(MAIN_ADMIN_ID)
         except Exception as e:
             logger.error(f"Ошибка загрузки: {e}")
             self.votes = {}
+            self.admin_users = [MAIN_ADMIN_ID]
 
     def get_next_monday_date(self):
         """Получаем дату следующего понедельника"""
@@ -99,7 +112,7 @@ class SimpleAttendanceBot:
 
     async def is_admin(self, user_id):
         """Проверяет, является ли пользователь администратором"""
-        return user_id == ADMIN_USER_ID
+        return user_id in self.admin_users
 
     async def check_admin_access(self, update: Update):
         """Проверяет права администратора"""
@@ -109,16 +122,168 @@ class SimpleAttendanceBot:
             return False
         return True
 
+    # ========== КОМАНДЫ УПРАВЛЕНИЯ АДМИНАМИ ==========
+
+    async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает список администраторов"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not self.admin_users:
+            await update.message.reply_text("📝 <b>Список администраторов пуст</b>", parse_mode='HTML')
+            return
+
+        admin_list = []
+        for i, admin_id in enumerate(self.admin_users, 1):
+            try:
+                admin_info = f"{i}. 🆔 <code>{admin_id}</code>"
+
+                # Пробуем получить информацию о пользователе
+                try:
+                    user = await context.bot.get_chat(admin_id)
+                    admin_info = f"{i}. 👤 {user.full_name}"
+                    if user.username:
+                        admin_info += f" (@{user.username})"
+                    admin_info += f" | 🆔 <code>{admin_id}</code>"
+                except:
+                    pass
+
+                # Помечаем главного администратора
+                if admin_id == MAIN_ADMIN_ID:
+                    admin_info += " 👑"
+
+                admin_list.append(admin_info)
+            except Exception as e:
+                admin_list.append(f"{i}. 🆔 <code>{admin_id}</code>")
+
+        text = "👑 <b>Администраторы бота:</b>\n\n" + "\n".join(admin_list)
+        text += f"\n\n📊 <b>Всего:</b> {len(self.admin_users)} администраторов"
+
+        await update.message.reply_text(text, parse_mode='HTML')
+
+    async def add_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Добавляет администратора"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ <b>Использование:</b>\n"
+                "<code>/add_admin 123456789</code> - добавить по ID\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /add_admin</i>",
+                parse_mode='HTML'
+            )
+            return
+
+        try:
+            # Получаем ID пользователя
+            if update.message.reply_to_message:
+                # Из ответа на сообщение
+                user_id = update.message.reply_to_message.from_user.id
+                user_name = update.message.reply_to_message.from_user.full_name
+            else:
+                # Из аргументов команды
+                user_id = int(context.args[0])
+                # Пробуем получить имя пользователя
+                try:
+                    user = await context.bot.get_chat(user_id)
+                    user_name = user.full_name
+                except:
+                    user_name = f"Пользователь ({user_id})"
+
+            # Проверяем, не добавлен ли уже
+            if user_id in self.admin_users:
+                await update.message.reply_text(
+                    f"ℹ️ <b>Пользователь уже является администратором</b>\n\n"
+                    f"👤 {user_name}\n"
+                    f"🆔 <code>{user_id}</code>",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Добавляем администратора
+            self.admin_users.append(user_id)
+            self.save_data()
+
+            await update.message.reply_text(
+                f"✅ <b>Новый администратор добавлен</b>\n\n"
+                f"👤 {user_name}\n"
+                f"🆔 <code>{user_id}</code>\n\n"
+                f"💡 <i>Теперь пользователь может использовать команды администратора</i>",
+                parse_mode='HTML'
+            )
+
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка добавления: {e}")
+
+    async def remove_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Удаляет администратора"""
+        if not await self.check_admin_access(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ <b>Использование:</b>\n"
+                "<code>/remove_admin 123456789</code> - удалить по ID\n\n"
+                "💡 <i>Нельзя удалить главного администратора</i>",
+                parse_mode='HTML'
+            )
+            return
+
+        try:
+            user_id = int(context.args[0])
+
+            # Проверяем, не пытаемся ли удалить главного администратора
+            if user_id == MAIN_ADMIN_ID:
+                await update.message.reply_text("❌ Нельзя удалить главного администратора!")
+                return
+
+            # Проверяем, есть ли пользователь в списке
+            if user_id not in self.admin_users:
+                await update.message.reply_text("❌ Пользователь не является администратором")
+                return
+
+            # Удаляем администратора
+            self.admin_users.remove(user_id)
+            self.save_data()
+
+            # Пробуем получить имя пользователя
+            try:
+                user = await context.bot.get_chat(user_id)
+                user_name = user.full_name
+            except:
+                user_name = f"Пользователь ({user_id})"
+
+            await update.message.reply_text(
+                f"✅ <b>Администратор удален</b>\n\n"
+                f"👤 {user_name}\n"
+                f"🆔 <code>{user_id}</code>\n\n"
+                f"💡 <i>Пользователь больше не может использовать команды администратора</i>",
+                parse_mode='HTML'
+            )
+
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка удаления: {e}")
+
     # ========== КОМАНДЫ ДЛЯ ПОЛУЧЕНИЯ ID ==========
 
     async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает ID пользователя"""
         user = update.effective_user
+        is_admin = await self.is_admin(user.id)
+
+        admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
+
         await update.message.reply_text(
             f"👤 <b>Ваша информация:</b>\n\n"
             f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
             f"📛 <b>Имя:</b> {user.full_name}\n"
-            f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}",
+            f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
+            f"🎯 <b>Статус:</b> {admin_status}",
             parse_mode='HTML'
         )
 
@@ -128,7 +293,6 @@ class SimpleAttendanceBot:
             await update.message.reply_text(
                 "❌ <b>Использование:</b>\n"
                 "<code>/get_id</code> - в ответ на сообщение пользователя\n"
-                "<code>/get_id @username</code> - по username\n"
                 "<code>/get_id 123456789</code> - по ID",
                 parse_mode='HTML'
             )
@@ -146,7 +310,7 @@ class SimpleAttendanceBot:
                     parse_mode='HTML'
                 )
             elif context.args:
-                target = context.args[0].lstrip('@')
+                target = context.args[0]
 
                 # Пробуем как ID
                 if target.isdigit():
@@ -166,24 +330,7 @@ class SimpleAttendanceBot:
                         await update.message.reply_text(f"❌ Пользователь с ID {target} не найден")
                         return
 
-                # Пробуем найти по username среди администраторов
-                try:
-                    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-                    for admin in admins:
-                        user = admin.user
-                        if user.username and user.username.lower() == target.lower():
-                            await update.message.reply_text(
-                                f"👤 <b>Информация о пользователе:</b>\n\n"
-                                f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
-                                f"📛 <b>Имя:</b> {user.full_name}\n"
-                                f"🔖 <b>Username:</b> @{user.username}</b>",
-                                parse_mode='HTML'
-                            )
-                            return
-
-                    await update.message.reply_text(f"❌ Пользователь @{target} не найден среди администраторов чата")
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Ошибка поиска: {e}")
+                await update.message.reply_text("❌ Используйте числовой ID пользователя")
 
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -267,10 +414,15 @@ class SimpleAttendanceBot:
                 return
 
             # Проверяем, является ли пользователь администратором
+            if await self.is_admin(user_id):
+                await update.message.reply_text("❌ Нельзя замутить администратора бота!")
+                return
+
+            # Проверяем, является ли пользователь администратором чата
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
                 if chat_member.status in ['administrator', 'creator']:
-                    await update.message.reply_text("❌ Нельзя замутить администратора!")
+                    await update.message.reply_text("❌ Нельзя замутить администратора чата!")
                     return
             except:
                 pass
@@ -419,11 +571,15 @@ class SimpleAttendanceBot:
             await update.message.reply_text("❌ Не могу замутить самого себя!")
             return
 
+        if await self.is_admin(user_to_mute.id):
+            await update.message.reply_text("❌ Нельзя замутить администратора бота!")
+            return
+
         try:
-            # Проверяем, является ли пользователь администратором
+            # Проверяем, является ли пользователь администратором чата
             chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_to_mute.id)
             if chat_member.status in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Нельзя замутить администратора!")
+                await update.message.reply_text("❌ Нельзя замутить администратора чата!")
                 return
         except:
             pass
@@ -539,6 +695,8 @@ class SimpleAttendanceBot:
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Помощь по командам"""
+        is_admin = await self.is_admin(update.effective_user.id)
+
         help_text = (
             "🤖 <b>Помощь по командам бота</b>\n\n"
 
@@ -547,24 +705,29 @@ class SimpleAttendanceBot:
             "<code>/attendance</code> - текущее голосование\n"
             "<code>/results</code> - результаты голосования\n"
             "<code>/voters</code> - кто как голосовал\n"
-            "<code>/admin</code> - панель управления\n"
             "<code>/status</code> - статус бота\n\n"
 
             "🆔 <b>Получение ID:</b>\n"
             "<code>/id</code> - ваш ID\n"
             "<code>/get_id</code> - ID пользователя (в ответ на сообщение)\n"
-            "<code>/all_ids</code> - ID всех администраторов\n"
+            "<code>/all_ids</code> - ID всех администраторов чата\n"
             "<code>/chat_info</code> - информация о чате\n\n"
+        )
 
-            "🔇 <b>Модерация (админ):</b>\n"
-            "<code>/mute ID</code> - мут пользователя\n"
-            "<code>/unmute ID</code> - размутить\n"
-            "<code>/mutelist</code> - список мутов\n\n"
+        if is_admin:
+            help_text += (
+                "👑 <b>Администраторские команды:</b>\n"
+                "<code>/admin</code> - панель управления\n"
+                "<code>/admins</code> - список администраторов бота\n"
+                "<code>/add_admin ID</code> - добавить администратора\n"
+                "<code>/remove_admin ID</code> - удалить администратора\n"
+                "<code>/mute ID</code> - мут пользователя\n"
+                "<code>/unmute ID</code> - размутить\n"
+                "<code>/mutelist</code> - список мутов\n"
+                "<code>/fix_rights</code> - проверить права бота\n\n"
+            )
 
-            "🔧 <b>Другое:</b>\n"
-            "<code>/fix_rights</code> - проверить права бота\n"
-            "<code>/help</code> - эта справка\n\n"
-
+        help_text += (
             "💡 <b>Советы:</b>\n"
             "• Используйте ID вместо username для команд\n"
             "• Для мута ответьте на сообщение командой /mute\n"
@@ -587,7 +750,8 @@ class SimpleAttendanceBot:
             "<code>/attendance</code> - голосование\n"
             "<code>/results</code> - результаты\n"
             "<code>/mute ID</code> - мут пользователя\n"
-            "<code>/id</code> - узнать ID\n\n"
+            "<code>/id</code> - узнать ID\n"
+            "<code>/admins</code> - управление администраторами\n\n"
             "💡 <i>Используйте /help для полного списка команд</i>",
             parse_mode='HTML'
         )
@@ -643,7 +807,8 @@ class SimpleAttendanceBot:
         await update.message.reply_text(
             "⚙️ <b>Панель управления посещаемостью</b>\n\n"
             f"📅 Следующий понедельник: {self.get_next_monday_date()}\n"
-            f"👥 Проголосовало: {len(self.votes)} человек\n\n"
+            f"👥 Проголосовало: {len(self.votes)} человек\n"
+            f"👑 Администраторов: {len(self.admin_users)}\n\n"
             f"💡 <i>Используйте кнопки для управления</i>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -651,18 +816,26 @@ class SimpleAttendanceBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статус бота"""
+        is_admin = await self.is_admin(update.effective_user.id)
+        admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
+
         status_text = (
             "🤖 <b>Статус бота:</b>\n\n"
             f"✅ <b>Бот активен</b>\n"
             f"📅 <b>Расписание:</b> Каждый понедельник в 19:00\n"
             f"🕐 <b>Следующий понедельник:</b> {self.get_next_monday_date()}\n"
-            f"👥 <b>Текущие голоса:</b> {len(self.votes)}\n\n"
+            f"👥 <b>Текущие голоса:</b> {len(self.votes)}\n"
+            f"👑 <b>Администраторов:</b> {len(self.admin_users)}\n"
+            f"🎯 <b>Ваш статус:</b> {admin_status}\n\n"
             f"💡 <i>Бот работает стабильно</i> 🚀"
         )
         await update.message.reply_text(status_text, parse_mode='HTML')
 
     async def fix_rights_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Проверка прав бота"""
+        if not await self.check_admin_access(update):
+            return
+
         chat_id = update.effective_chat.id
 
         try:
@@ -787,8 +960,8 @@ class SimpleAttendanceBot:
             text = f"{emoji} {label} ({count} - {percentage:.1f}%)"
             keyboard.append([InlineKeyboardButton(text, callback_data=f"vote_{option}")])
 
-        if await self.is_admin(ADMIN_USER_ID):
-            keyboard.append([InlineKeyboardButton("📊 Посмотреть результаты", callback_data="admin_full_stats")])
+        # Только администраторы видят кнопку результатов
+        keyboard.append([InlineKeyboardButton("📊 Посмотреть результаты", callback_data="admin_full_stats")])
 
         return InlineKeyboardMarkup(keyboard)
 
@@ -1009,9 +1182,9 @@ class SimpleAttendanceBot:
 
 
 if __name__ == "__main__":
-    print("🚀 Запуск упрощенного бота для учета посещаемости...")
+    print("🚀 Запуск бота для учета посещаемости с системой админов...")
     print(f"📅 Расписание: каждый понедельник в 19:00")
-    print(f"👑 Админ ID: {ADMIN_USER_ID}")
+    print(f"👑 Главный админ ID: {MAIN_ADMIN_ID}")
     print("💡 Используйте /help для списка команд")
 
     bot = SimpleAttendanceBot(BOT_TOKEN)
