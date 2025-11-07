@@ -1,12 +1,19 @@
 {
-  "chat_id": -1002919624785,
-  "last_poll_message_id": 6068,
-  "current_poll_id": "1762536536",
-  "votes": {},
+  "chat_id": -1003205745038,
+  "last_poll_message_id": 130,
+  "current_poll_id": "1762551170",
+  "votes": {
+    "5141893293": {
+      "option": "1",
+      "name": "08.34.2025",
+      "timestamp": "2025-11-08T00:32:53.671707",
+      "username": "ilkogys"
+    }
+  },
   "mute_settings": {
     "enabled": true,
     "duration": 3600,
     "reply_to_mute": true
   },
-  "last_updated": "2025-11-08T00:05:48.153958"
+  "last_updated": "2025-11-08T00:32:53.793035"
 }

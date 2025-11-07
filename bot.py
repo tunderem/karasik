@@ -140,36 +140,15 @@ class MondayAttendanceBot:
                 "<code>/mute @username 1h</code> - замутить на 1 час\n"
                 "<code>/mute @username 1d</code> - замутить на 1 день\n"
                 "<code>/mute @username 1w</code> - замутить на 1 неделю\n"
-                "<code>/mute 123456789</code> - замутить по ID на время по умолчанию\n\n"
-                "Или просто ответьте на сообщение пользователя с командой <code>/mute</code>\n\n"
-                "💡 <i>Подсказка: используйте /mute_settings для настроек</i>",
+                "<code>/mute 123456789</code> - замутить по ID\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>",
                 parse_mode='HTML'
             )
             return
 
-        # Парсим аргументы
-        username_or_id = context.args[0]
-
-        # Если передан только один аргумент, используем время по умолчанию
-        if len(context.args) == 1:
-            duration_str = "10m"  # время по умолчанию
-        else:
-            duration_str = context.args[1]
-
-        # Проверяем, является ли первый аргумент временем (если передан только один аргумент)
-        if len(context.args) == 1:
-            # Проверяем, не является ли единственный аргумент временем
-            parsed_duration = await self.parse_duration(username_or_id)
-            if parsed_duration:
-                # Если это время, значит username не указан - ошибка
-                await update.message.reply_text(
-                    "❌ <b>Не указан пользователь!</b>\n\n"
-                    "<code>/mute @username 10m</code> - замутить пользователя\n"
-                    "<code>/mute @username</code> - замутить на время по умолчанию\n\n"
-                    "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>",
-                    parse_mode='HTML'
-                )
-                return
+        # Получаем username/id и время
+        target = context.args[0]
+        duration_str = context.args[1] if len(context.args) > 1 else "10m"
 
         # Парсим время
         duration = await self.parse_duration(duration_str)
@@ -178,9 +157,29 @@ class MondayAttendanceBot:
             return
 
         try:
-            user_id = await self.get_user_id_by_username(username_or_id, update.effective_chat.id, context)
-            until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
+            # Ищем пользователя
+            user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
+            if not user_id:
+                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                return
+
+            # Проверяем, не пытаемся ли замутить бота или администратора
+            if user_id == context.bot.id:
+                await update.message.reply_text("❌ Не могу замутить самого себя!")
+                return
+
+            # Проверяем, является ли пользователь администратором
+            try:
+                chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+                if chat_member.status in ['administrator', 'creator']:
+                    await update.message.reply_text("❌ Нельзя замутить администратора!")
+                    return
+            except Exception as e:
+                logger.error(f"Ошибка проверки прав пользователя: {e}")
+
+            # Выполняем мут
+            until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
             await context.bot.restrict_chat_member(
                 chat_id=update.effective_chat.id,
                 user_id=user_id,
@@ -188,22 +187,22 @@ class MondayAttendanceBot:
                 until_date=until_date
             )
 
-            user_info = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-            user_name = user_info.user.full_name
-
             await update.message.reply_text(
                 f"🔇 <b>{user_name} замьючен на {self.format_duration(duration)}</b>\n\n"
                 f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}\n"
                 f"🆔 ID: <code>{user_id}</code>\n\n"
-                f"💡 <i>Используйте /unmute @{username_or_id} для размута</i>",
+                f"💡 <i>Используйте /unmute {target} для размута</i>",
                 parse_mode='HTML'
             )
 
         except BadRequest as e:
-            if "not enough rights" in str(e).lower():
+            error_msg = str(e).lower()
+            if "not enough rights" in error_msg:
                 await update.message.reply_text("❌ У бота недостаточно прав для ограничения пользователей")
-            elif "user is an administrator" in str(e).lower():
+            elif "user is an administrator" in error_msg:
                 await update.message.reply_text("❌ Нельзя замутить администратора")
+            elif "user not found" in error_msg:
+                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
             else:
                 await update.message.reply_text(f"❌ Ошибка мута: {e}")
         except Exception as e:
@@ -219,25 +218,27 @@ class MondayAttendanceBot:
                 "❌ <b>Использование:</b>\n"
                 "<code>/unmute @username</code>\n"
                 "<code>/unmute 123456789</code> - размутить по ID\n\n"
-                "Или просто ответьте на сообщение пользователя с командой <code>/unmute</code>\n\n"
-                "💡 <i>Подсказка: можно использовать ID пользователя вместо @username</i>",
+                "💡 <i>Или ответьте на сообщение пользователя с командой /unmute</i>",
                 parse_mode='HTML'
             )
             return
 
-        username = context.args[0]
+        target = context.args[0]
 
         try:
-            user_id = await self.get_user_id_by_username(username, update.effective_chat.id, context)
+            # Ищем пользователя
+            user_id, user_name = await self.find_user_in_chat(update.effective_chat.id, target, context)
 
+            if not user_id:
+                await update.message.reply_text(f"❌ Пользователь '{target}' не найден в этом чате")
+                return
+
+            # Выполняем размут
             await context.bot.restrict_chat_member(
                 chat_id=update.effective_chat.id,
                 user_id=user_id,
                 permissions=self.get_unmute_permissions()
             )
-
-            user_info = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-            user_name = user_info.user.full_name
 
             await update.message.reply_text(
                 f"🔊 <b>{user_name} размьючен</b>\n\n"
@@ -253,6 +254,40 @@ class MondayAttendanceBot:
                 await update.message.reply_text(f"❌ Ошибка размута: {e}")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка размута: {e}")
+
+    async def find_user_in_chat(self, chat_id, target, context):
+        """Находит пользователя в чате по username, ID или имени"""
+        target = target.lstrip('@')  # Убираем @ если есть
+
+        # Пробуем как ID
+        try:
+            user_id = int(target)
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            return user_id, member.user.full_name
+        except (ValueError, BadRequest):
+            pass  # Это не ID или пользователь не найден
+
+        # Ищем по username или имени среди участников чата
+        try:
+            async for member in context.bot.get_chat_members(chat_id):
+                user = member.user
+
+                # Проверяем username
+                if user.username and user.username.lower() == target.lower():
+                    return user.id, user.full_name
+
+                # Проверяем полное имя
+                if user.full_name.lower() == target.lower():
+                    return user.id, user.full_name
+
+                # Проверяем частичное совпадение имени
+                if target.lower() in user.full_name.lower():
+                    return user.id, user.full_name
+
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя: {e}")
+
+        return None, None
 
     async def mute_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список замьюченных пользователей"""
@@ -590,50 +625,6 @@ class MondayAttendanceBot:
             can_invite_users=True,
             can_pin_messages=False
         )
-
-    async def get_user_id_by_username(self, username, chat_id, context):
-        """Получает ID пользователя по username или ID"""
-        if username.startswith('@'):
-            username = username[1:]
-
-        # Пробуем как ID
-        try:
-            user_id = int(username)
-            # Проверяем, существует ли пользователь с таким ID в чате
-            try:
-                member = await context.bot.get_chat_member(chat_id, user_id)
-                return user_id
-            except:
-                pass  # Продолжаем поиск по username
-        except ValueError:
-            pass  # Это не число, продолжаем поиск по username
-
-        try:
-            # Ищем среди участников чата
-            async for member in context.bot.get_chat_members(chat_id):
-                user = member.user
-
-                # Поиск по username
-                if user.username and user.username.lower() == username.lower():
-                    return user.id
-
-                # Поиск по полному имени (без учета регистра)
-                if user.full_name.lower() == username.lower():
-                    return user.id
-
-                # Поиск по части username
-                if user.username and username.lower() in user.username.lower():
-                    return user.id
-
-                # Поиск по части имени
-                if username.lower() in user.full_name.lower():
-                    return user.id
-
-            raise Exception(f"Пользователь '{username}' не найден в этом чате")
-
-        except Exception as e:
-            logger.error(f"Ошибка поиска пользователя: {e}")
-            raise Exception(f"Пользователь '{username}' не найден в этом чате")
 
     async def update_mute_settings_message(self, query):
         """Обновляет сообщение с настройками мута"""
