@@ -22,11 +22,8 @@ MAIN_ADMIN_ID = 2073879359  # Главный администратор (нел�
 class SimpleAttendanceBot:
     def __init__(self, token):
         self.token = token
-        self.chat_id = None
-        self.last_poll_message_id = None
-        self.current_poll_id = None
-        self.votes = {}
-        self.admin_users = [MAIN_ADMIN_ID]  # Список администраторов
+        # Основная структура данных с разделением по chat_id
+        self.chat_data = {}
         self.application = Application.builder().token(token).build()
 
         # Обработчики команд
@@ -65,15 +62,23 @@ class SimpleAttendanceBot:
         self.application.add_handler(
             MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/unmute\b'), self.handle_reply_unmute))
 
+    def get_chat_data(self, chat_id):
+        """Получает данные чата, создает если нет"""
+        if chat_id not in self.chat_data:
+            self.chat_data[chat_id] = {
+                'last_poll_message_id': None,
+                'current_poll_id': None,
+                'votes': {},
+                'admin_users': [MAIN_ADMIN_ID],  # Главный админ всегда в списке
+                'last_updated': datetime.now().isoformat()
+            }
+        return self.chat_data[chat_id]
+
     def save_data(self):
         """Сохраняем данные"""
         try:
             data = {
-                'chat_id': self.chat_id,
-                'last_poll_message_id': self.last_poll_message_id,
-                'current_poll_id': self.current_poll_id,
-                'votes': self.votes,
-                'admin_users': self.admin_users,
+                'chat_data': self.chat_data,
                 'last_updated': datetime.now().isoformat()
             }
             with open('attendance_data.json', 'w', encoding='utf-8') as f:
@@ -87,19 +92,29 @@ class SimpleAttendanceBot:
             if os.path.exists('attendance_data.json'):
                 with open('attendance_data.json', 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.chat_id = data.get('chat_id')
-                    self.last_poll_message_id = data.get('last_poll_message_id')
-                    self.current_poll_id = data.get('current_poll_id')
-                    self.votes = data.get('votes', {})
-                    self.admin_users = data.get('admin_users', [MAIN_ADMIN_ID])
 
-                    # Гарантируем, что главный админ всегда в списке
-                    if MAIN_ADMIN_ID not in self.admin_users:
-                        self.admin_users.append(MAIN_ADMIN_ID)
+                    # Поддержка старого формата данных
+                    if 'chat_data' in data:
+                        self.chat_data = data['chat_data']
+                    else:
+                        # Конвертация старого формата в новый
+                        old_chat_id = data.get('chat_id')
+                        if old_chat_id:
+                            self.chat_data[old_chat_id] = {
+                                'last_poll_message_id': data.get('last_poll_message_id'),
+                                'current_poll_id': data.get('current_poll_id'),
+                                'votes': data.get('votes', {}),
+                                'admin_users': data.get('admin_users', [MAIN_ADMIN_ID])
+                            }
+
+                    # Гарантируем, что главный админ всегда в списке для каждого чата
+                    for chat_id in self.chat_data:
+                        if MAIN_ADMIN_ID not in self.chat_data[chat_id]['admin_users']:
+                            self.chat_data[chat_id]['admin_users'].append(MAIN_ADMIN_ID)
+
         except Exception as e:
             logger.error(f"Ошибка загрузки: {e}")
-            self.votes = {}
-            self.admin_users = [MAIN_ADMIN_ID]
+            self.chat_data = {}
 
     def get_next_monday_date(self):
         """Получаем дату следующего понедельника"""
@@ -110,31 +125,38 @@ class SimpleAttendanceBot:
         next_monday = today + timedelta(days=days_ahead)
         return next_monday.strftime('%d.%m.%Y')
 
-    async def is_admin(self, user_id):
-        """Проверяет, является ли пользователь администратором"""
-        return user_id in self.admin_users
+    async def is_admin(self, chat_id, user_id):
+        """Проверяет, является ли пользователь администратором в конкретном чате"""
+        chat_data = self.get_chat_data(chat_id)
+        return user_id in chat_data['admin_users']
 
     async def check_admin_access(self, update: Update):
-        """Проверяет права администратора"""
+        """Проверяет права администратора в текущем чате"""
         user_id = update.effective_user.id
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("🚫 У вас нет прав администратора!")
+        chat_id = update.effective_chat.id
+
+        if not await self.is_admin(chat_id, user_id):
+            await update.message.reply_text("🚫 У вас нет прав администратора в этом чате!")
             return False
         return True
 
     # ========== КОМАНДЫ УПРАВЛЕНИЯ АДМИНАМИ ==========
 
     async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список администраторов"""
+        """Показывает список администраторов текущего чата"""
         if not await self.check_admin_access(update):
             return
 
-        if not self.admin_users:
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+        admin_users = chat_data['admin_users']
+
+        if not admin_users:
             await update.message.reply_text("📝 <b>Список администраторов пуст</b>", parse_mode='HTML')
             return
 
         admin_list = []
-        for i, admin_id in enumerate(self.admin_users, 1):
+        for i, admin_id in enumerate(admin_users, 1):
             try:
                 admin_info = f"{i}. 🆔 <code>{admin_id}</code>"
 
@@ -156,13 +178,13 @@ class SimpleAttendanceBot:
             except Exception as e:
                 admin_list.append(f"{i}. 🆔 <code>{admin_id}</code>")
 
-        text = "👑 <b>Администраторы бота:</b>\n\n" + "\n".join(admin_list)
-        text += f"\n\n📊 <b>Всего:</b> {len(self.admin_users)} администраторов"
+        text = f"👑 <b>Администраторы чата {chat_id}:</b>\n\n" + "\n".join(admin_list)
+        text += f"\n\n📊 <b>Всего:</b> {len(admin_users)} администраторов"
 
         await update.message.reply_text(text, parse_mode='HTML')
 
     async def add_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Добавляет администратора"""
+        """Добавляет администратора в текущий чат"""
         if not await self.check_admin_access(update):
             return
 
@@ -176,6 +198,9 @@ class SimpleAttendanceBot:
             return
 
         try:
+            chat_id = update.effective_chat.id
+            chat_data = self.get_chat_data(chat_id)
+
             # Получаем ID пользователя
             if update.message.reply_to_message:
                 # Из ответа на сообщение
@@ -192,9 +217,9 @@ class SimpleAttendanceBot:
                     user_name = f"Пользователь ({user_id})"
 
             # Проверяем, не добавлен ли уже
-            if user_id in self.admin_users:
+            if user_id in chat_data['admin_users']:
                 await update.message.reply_text(
-                    f"ℹ️ <b>Пользователь уже является администратором</b>\n\n"
+                    f"ℹ️ <b>Пользователь уже является администратором этого чата</b>\n\n"
                     f"👤 {user_name}\n"
                     f"🆔 <code>{user_id}</code>",
                     parse_mode='HTML'
@@ -202,14 +227,14 @@ class SimpleAttendanceBot:
                 return
 
             # Добавляем администратора
-            self.admin_users.append(user_id)
+            chat_data['admin_users'].append(user_id)
             self.save_data()
 
             await update.message.reply_text(
-                f"✅ <b>Новый администратор добавлен</b>\n\n"
+                f"✅ <b>Новый администратор добавлен в этот чат</b>\n\n"
                 f"👤 {user_name}\n"
                 f"🆔 <code>{user_id}</code>\n\n"
-                f"💡 <i>Теперь пользователь может использовать команды администратора</i>",
+                f"💡 <i>Теперь пользователь может использовать команды администратора в этом чате</i>",
                 parse_mode='HTML'
             )
 
@@ -219,7 +244,7 @@ class SimpleAttendanceBot:
             await update.message.reply_text(f"❌ Ошибка добавления: {e}")
 
     async def remove_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удаляет администратора"""
+        """Удаляет администратора из текущего чата"""
         if not await self.check_admin_access(update):
             return
 
@@ -233,6 +258,8 @@ class SimpleAttendanceBot:
             return
 
         try:
+            chat_id = update.effective_chat.id
+            chat_data = self.get_chat_data(chat_id)
             user_id = int(context.args[0])
 
             # Проверяем, не пытаемся ли удалить главного администратора
@@ -241,12 +268,12 @@ class SimpleAttendanceBot:
                 return
 
             # Проверяем, есть ли пользователь в списке
-            if user_id not in self.admin_users:
-                await update.message.reply_text("❌ Пользователь не является администратором")
+            if user_id not in chat_data['admin_users']:
+                await update.message.reply_text("❌ Пользователь не является администратором этого чата")
                 return
 
             # Удаляем администратора
-            self.admin_users.remove(user_id)
+            chat_data['admin_users'].remove(user_id)
             self.save_data()
 
             # Пробуем получить имя пользователя
@@ -257,10 +284,10 @@ class SimpleAttendanceBot:
                 user_name = f"Пользователь ({user_id})"
 
             await update.message.reply_text(
-                f"✅ <b>Администратор удален</b>\n\n"
+                f"✅ <b>Администратор удален из этого чата</b>\n\n"
                 f"👤 {user_name}\n"
                 f"🆔 <code>{user_id}</code>\n\n"
-                f"💡 <i>Пользователь больше не может использовать команды администратора</i>",
+                f"💡 <i>Пользователь больше не может использовать команды администратора в этом чате</i>",
                 parse_mode='HTML'
             )
 
@@ -274,7 +301,8 @@ class SimpleAttendanceBot:
     async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает ID пользователя"""
         user = update.effective_user
-        is_admin = await self.is_admin(user.id)
+        chat_id = update.effective_chat.id
+        is_admin = await self.is_admin(chat_id, user.id)
 
         admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
 
@@ -283,7 +311,8 @@ class SimpleAttendanceBot:
             f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
             f"📛 <b>Имя:</b> {user.full_name}\n"
             f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
-            f"🎯 <b>Статус:</b> {admin_status}",
+            f"💬 <b>ID чата:</b> <code>{chat_id}</code>\n"
+            f"🎯 <b>Статус в этом чате:</b> {admin_status}",
             parse_mode='HTML'
         )
 
@@ -368,11 +397,19 @@ class SimpleAttendanceBot:
         """Показывает информацию о чате"""
         try:
             chat = update.effective_chat
+            chat_id = chat.id
+            chat_data = self.get_chat_data(chat_id)
+
+            admin_count = len(chat_data['admin_users'])
+            votes_count = len(chat_data['votes'])
+
             await update.message.reply_text(
                 f"💬 <b>Информация о чате:</b>\n\n"
                 f"📛 <b>Название:</b> {chat.title}\n"
                 f"🆔 <b>ID чата:</b> <code>{chat.id}</code>\n"
-                f"👥 <b>Тип:</b> {chat.type}",
+                f"👥 <b>Тип:</b> {chat.type}\n"
+                f"👑 <b>Админов бота:</b> {admin_count}\n"
+                f"🗳️ <b>Голосов:</b> {votes_count}",
                 parse_mode='HTML'
             )
         except Exception as e:
@@ -396,6 +433,9 @@ class SimpleAttendanceBot:
             return
 
         try:
+            chat_id = update.effective_chat.id
+            chat_data = self.get_chat_data(chat_id)
+
             # Получаем ID и время
             target_id = context.args[0]
             duration_str = context.args[1] if len(context.args) > 1 else "10m"
@@ -414,7 +454,7 @@ class SimpleAttendanceBot:
                 return
 
             # Проверяем, является ли пользователь администратором
-            if await self.is_admin(user_id):
+            if await self.is_admin(chat_id, user_id):
                 await update.message.reply_text("❌ Нельзя замутить администратора бота!")
                 return
 
@@ -478,6 +518,7 @@ class SimpleAttendanceBot:
             return
 
         try:
+            chat_id = update.effective_chat.id
             user_id = int(context.args[0])
 
             # Выполняем размут
@@ -565,13 +606,14 @@ class SimpleAttendanceBot:
             return
 
         user_to_mute = replied_message.from_user
+        chat_id = update.effective_chat.id
 
         # Проверяем, не пытаемся ли замутить бота или администратора
         if user_to_mute.id == context.bot.id:
             await update.message.reply_text("❌ Не могу замутить самого себя!")
             return
 
-        if await self.is_admin(user_to_mute.id):
+        if await self.is_admin(chat_id, user_to_mute.id):
             await update.message.reply_text("❌ Нельзя замутить администратора бота!")
             return
 
@@ -695,7 +737,8 @@ class SimpleAttendanceBot:
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Помощь по командам"""
-        is_admin = await self.is_admin(update.effective_user.id)
+        chat_id = update.effective_chat.id
+        is_admin = await self.is_admin(chat_id, update.effective_user.id)
 
         help_text = (
             "🤖 <b>Помощь по командам бота</b>\n\n"
@@ -731,37 +774,40 @@ class SimpleAttendanceBot:
             "💡 <b>Советы:</b>\n"
             "• Используйте ID вместо username для команд\n"
             "• Для мута ответьте на сообщение командой /mute\n"
-            "• Бот создает голосования каждый понедельник в 19:00"
+            "• Бот создает голосования каждый понедельник в 19:00\n"
+            "• Каждый чат имеет отдельный список администраторов"
         )
 
         await update.message.reply_text(help_text, parse_mode='HTML')
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда start"""
-        if not await self.check_admin_access(update):
-            return
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
 
-        self.chat_id = update.effective_chat.id
-
+        # Активируем бота в чате
         await update.message.reply_text(
-            "✅ <b>Бот для учета посещаемости активирован!</b>\n\n"
-            "📅 <b>Каждый понедельник в 19:00</b> я буду создавать новое голосование.\n\n"
-            "⚡ <b>Основные команды:</b>\n"
-            "<code>/attendance</code> - голосование\n"
-            "<code>/results</code> - результаты\n"
-            "<code>/mute ID</code> - мут пользователя\n"
-            "<code>/id</code> - узнать ID\n"
-            "<code>/admins</code> - управление администраторами\n\n"
-            "💡 <i>Используйте /help для полного списка команд</i>",
+            f"✅ <b>Бот для учета посещаемости активирован в этом чате!</b>\n\n"
+            f"📅 <b>Каждый понедельник в 19:00</b> я буду создавать новое голосование.\n\n"
+            f"⚡ <b>Основные команды:</b>\n"
+            f"<code>/attendance</code> - голосование\n"
+            f"<code>/results</code> - результаты\n"
+            f"<code>/mute ID</code> - мут пользователя\n"
+            f"<code>/id</code> - узнать ID\n"
+            f"<code>/admins</code> - управление администраторами\n\n"
+            f"💡 <i>Используйте /help для полного списка команд</i>",
             parse_mode='HTML'
         )
         self.save_data()
 
-        await self.create_monday_poll()
+        await self.create_monday_poll(chat_id)
 
     async def attendance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Текущее голосование"""
-        if not self.current_poll_id:
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+
+        if not chat_data['current_poll_id']:
             await update.message.reply_text(
                 "❌ Сейчас нет активного голосования\n\n"
                 "💡 <i>Новое создастся в понедельник в 19:00</i>",
@@ -776,26 +822,35 @@ class SimpleAttendanceBot:
 
     async def results_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Результаты голосования"""
-        if not self.current_poll_id:
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+
+        if not chat_data['current_poll_id']:
             await update.message.reply_text("❌ Сейчас нет активного голосования")
             return
 
-        results_text = await self.get_results_text()
+        results_text = await self.get_results_text(chat_id)
         await update.message.reply_text(results_text, parse_mode='HTML')
 
     async def voters_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Список голосовавших"""
-        if not self.current_poll_id:
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+
+        if not chat_data['current_poll_id']:
             await update.message.reply_text("❌ Сейчас нет активного голосования")
             return
 
-        voters_text = await self.get_voters_text()
+        voters_text = await self.get_voters_text(chat_id)
         await update.message.reply_text(voters_text, parse_mode='HTML')
 
     async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Панель управления"""
         if not await self.check_admin_access(update):
             return
+
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
 
         keyboard = [
             [InlineKeyboardButton("📊 Полная статистика", callback_data="admin_full_stats")],
@@ -807,8 +862,9 @@ class SimpleAttendanceBot:
         await update.message.reply_text(
             "⚙️ <b>Панель управления посещаемостью</b>\n\n"
             f"📅 Следующий понедельник: {self.get_next_monday_date()}\n"
-            f"👥 Проголосовало: {len(self.votes)} человек\n"
-            f"👑 Администраторов: {len(self.admin_users)}\n\n"
+            f"👥 Проголосовало: {len(chat_data['votes'])} человек\n"
+            f"👑 Администраторов: {len(chat_data['admin_users'])}\n"
+            f"💬 ID чата: <code>{chat_id}</code>\n\n"
             f"💡 <i>Используйте кнопки для управления</i>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -816,7 +872,9 @@ class SimpleAttendanceBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статус бота"""
-        is_admin = await self.is_admin(update.effective_user.id)
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+        is_admin = await self.is_admin(chat_id, update.effective_user.id)
         admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
 
         status_text = (
@@ -824,8 +882,9 @@ class SimpleAttendanceBot:
             f"✅ <b>Бот активен</b>\n"
             f"📅 <b>Расписание:</b> Каждый понедельник в 19:00\n"
             f"🕐 <b>Следующий понедельник:</b> {self.get_next_monday_date()}\n"
-            f"👥 <b>Текущие голоса:</b> {len(self.votes)}\n"
-            f"👑 <b>Администраторов:</b> {len(self.admin_users)}\n"
+            f"👥 <b>Текущие голоса:</b> {len(chat_data['votes'])}\n"
+            f"👑 <b>Администраторов:</b> {len(chat_data['admin_users'])}\n"
+            f"💬 <b>ID чата:</b> <code>{chat_id}</code>\n"
             f"🎯 <b>Ваш статус:</b> {admin_status}\n\n"
             f"💡 <i>Бот работает стабильно</i> 🚀"
         )
@@ -883,13 +942,12 @@ class SimpleAttendanceBot:
 
     # ========== СИСТЕМНЫЕ МЕТОДЫ ==========
 
-    async def create_monday_poll(self):
-        """Создает голосование о посещаемости"""
-        if not self.chat_id:
-            return
+    async def create_monday_poll(self, chat_id):
+        """Создает голосование о посещаемости для конкретного чата"""
+        chat_data = self.get_chat_data(chat_id)
 
         try:
-            self.current_poll_id = str(int(datetime.now().timestamp()))
+            chat_data['current_poll_id'] = str(int(datetime.now().timestamp()))
 
             message_text = (
                 f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
@@ -901,51 +959,52 @@ class SimpleAttendanceBot:
                 "💡 <i>Отметьтесь, пожалуйста, чтобы все были в курсе</i>"
             )
 
-            keyboard = await self.create_voting_keyboard()
+            keyboard = await self.create_voting_keyboard(chat_id)
 
             message = await self.application.bot.send_message(
-                chat_id=self.chat_id,
+                chat_id=chat_id,
                 text=message_text,
                 reply_markup=keyboard,
                 parse_mode='HTML'
             )
 
             try:
-                if self.last_poll_message_id:
+                if chat_data['last_poll_message_id']:
                     try:
                         await self.application.bot.unpin_chat_message(
-                            chat_id=self.chat_id,
-                            message_id=self.last_poll_message_id
+                            chat_id=chat_id,
+                            message_id=chat_data['last_poll_message_id']
                         )
                     except:
                         pass
 
                 await self.application.bot.pin_chat_message(
-                    chat_id=self.chat_id,
+                    chat_id=chat_id,
                     message_id=message.message_id,
                     disable_notification=True
                 )
 
-                self.last_poll_message_id = message.message_id
-                logger.info("✅ Сообщение закреплено")
+                chat_data['last_poll_message_id'] = message.message_id
+                logger.info(f"✅ Сообщение закреплено в чате {chat_id}")
 
             except Exception as e:
-                logger.warning(f"❌ Не удалось закрепить: {e}")
+                logger.warning(f"❌ Не удалось закрепить в чате {chat_id}: {e}")
 
             self.save_data()
-            logger.info(f"✅ Новое голосование создано")
+            logger.info(f"✅ Новое голосование создано в чате {chat_id}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка создания голосования: {e}")
+            logger.error(f"❌ Ошибка создания голосования в чате {chat_id}: {e}")
 
-    async def create_voting_keyboard(self):
+    async def create_voting_keyboard(self, chat_id):
         """Создает клавиатуру для голосования"""
+        chat_data = self.get_chat_data(chat_id)
         votes_count = {'1': 0, '2': 0, '3': 0}
-        for vote_data in self.votes.values():
+        for vote_data in chat_data['votes'].values():
             option = vote_data['option']
             votes_count[option] += 1
 
-        total_votes = len(self.votes)
+        total_votes = len(chat_data['votes'])
 
         keyboard = []
         options = [
@@ -965,17 +1024,19 @@ class SimpleAttendanceBot:
 
         return InlineKeyboardMarkup(keyboard)
 
-    async def get_results_text(self):
+    async def get_results_text(self, chat_id):
         """Текст результатов голосования"""
-        if not self.current_poll_id:
+        chat_data = self.get_chat_data(chat_id)
+
+        if not chat_data['current_poll_id']:
             return "Нет активного голосования"
 
         votes_count = {'1': 0, '2': 0, '3': 0}
-        for vote_data in self.votes.values():
+        for vote_data in chat_data['votes'].values():
             option = vote_data['option']
             votes_count[option] += 1
 
-        total_votes = len(self.votes)
+        total_votes = len(chat_data['votes'])
 
         text = f"<b>📊 Посещаемость на следующий понедельник:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
@@ -996,9 +1057,11 @@ class SimpleAttendanceBot:
         text += f"\n\n💡 <i>Используйте /voters чтобы посмотреть кто как голосовал</i>"
         return text
 
-    async def get_voters_text(self):
+    async def get_voters_text(self, chat_id):
         """Текст списка голосовавших"""
-        if not self.votes:
+        chat_data = self.get_chat_data(chat_id)
+
+        if not chat_data['votes']:
             return "Пока никто не отметился"
 
         votes_by_option = {
@@ -1007,7 +1070,7 @@ class SimpleAttendanceBot:
             '3': []
         }
 
-        for vote_data in self.votes.values():
+        for vote_data in chat_data['votes'].values():
             option = vote_data['option']
             name = vote_data['name']
             username = vote_data.get('username')
@@ -1037,9 +1100,10 @@ class SimpleAttendanceBot:
         text += "💡 <i>Голосование обновляется в реальном времени</i>"
         return text
 
-    async def get_full_stats_text(self):
+    async def get_full_stats_text(self, chat_id):
         """Полная статистика"""
-        total_users = len(self.votes)
+        chat_data = self.get_chat_data(chat_id)
+        total_users = len(chat_data['votes'])
 
         text = f"<b>📈 Статистика посещаемости:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
@@ -1047,7 +1111,7 @@ class SimpleAttendanceBot:
         votes_count = {'1': 0, '2': 0, '3': 0}
         voters_by_option = {'1': [], '2': [], '3': []}
 
-        for vote_data in self.votes.values():
+        for vote_data in chat_data['votes'].values():
             option = vote_data['option']
             name = vote_data['name']
             votes_count[option] += 1
@@ -1081,18 +1145,20 @@ class SimpleAttendanceBot:
         """Обработка голосования"""
         query = update.callback_query
         user = query.from_user
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
 
         try:
             option = query.data.split('_')[1]
 
-            self.votes[str(user.id)] = {
+            chat_data['votes'][str(user.id)] = {
                 'option': option,
                 'name': user.full_name,
                 'timestamp': datetime.now().isoformat(),
                 'username': user.username
             }
 
-            keyboard = await self.create_voting_keyboard()
+            keyboard = await self.create_voting_keyboard(chat_id)
 
             try:
                 await query.edit_message_reply_markup(reply_markup=keyboard)
@@ -1110,20 +1176,22 @@ class SimpleAttendanceBot:
         """Обработка админ-команд"""
         query = update.callback_query
         user = query.from_user
+        chat_id = update.effective_chat.id
 
-        if not await self.is_admin(user.id):
+        if not await self.is_admin(chat_id, user.id):
             await query.answer("🚫 Нет прав!")
             return
 
         try:
             data = query.data
+            chat_data = self.get_chat_data(chat_id)
 
             if data == "admin_full_stats":
-                stats_text = await self.get_full_stats_text()
+                stats_text = await self.get_full_stats_text(chat_id)
                 await query.message.reply_text(stats_text, parse_mode='HTML')
 
             elif data == "admin_refresh":
-                keyboard = await self.create_voting_keyboard()
+                keyboard = await self.create_voting_keyboard(chat_id)
                 try:
                     await query.edit_message_reply_markup(reply_markup=keyboard)
                 except BadRequest:
@@ -1131,8 +1199,8 @@ class SimpleAttendanceBot:
                 await query.answer("✅ Голосование обновлено!")
 
             elif data == "admin_clear":
-                self.votes = {}
-                keyboard = await self.create_voting_keyboard()
+                chat_data['votes'] = {}
+                keyboard = await self.create_voting_keyboard(chat_id)
                 try:
                     await query.edit_message_reply_markup(reply_markup=keyboard)
                 except BadRequest:
@@ -1141,7 +1209,7 @@ class SimpleAttendanceBot:
                 self.save_data()
 
             elif data == "admin_create_now":
-                await self.create_monday_poll()
+                await self.create_monday_poll(chat_id)
                 await query.answer("✅ Голосование создано!")
 
             await query.answer()
@@ -1150,13 +1218,20 @@ class SimpleAttendanceBot:
             await query.answer("❌ Ошибка")
 
     async def check_schedule(self):
-        """Проверка расписания"""
+        """Проверка расписания для всех активных чатов"""
         while True:
             try:
                 now = datetime.now()
                 if now.weekday() == 0 and now.hour == 19 and now.minute == 0:
-                    logger.info("Создаем новое голосование по расписанию!")
-                    await self.create_monday_poll()
+                    logger.info("Создаем новое голосование по расписанию для всех чатов!")
+
+                    # Создаем голосование для каждого активного чата
+                    for chat_id in self.chat_data.keys():
+                        try:
+                            await self.create_monday_poll(chat_id)
+                        except Exception as e:
+                            logger.error(f"Ошибка создания голосования в чате {chat_id}: {e}")
+
                     await asyncio.sleep(61)
                 else:
                     await asyncio.sleep(30)
@@ -1173,10 +1248,14 @@ class SimpleAttendanceBot:
         await self.application.updater.start_polling()
 
         logger.info("🤖 Бот запущен!")
+        logger.info(f"📊 Активных чатов: {len(self.chat_data)}")
 
-        if not self.current_poll_id and self.chat_id:
-            logger.info("Создаем первое голосование...")
-            await self.create_monday_poll()
+        # Создаем голосования для всех активных чатов
+        for chat_id in self.chat_data.keys():
+            chat_data = self.get_chat_data(chat_id)
+            if not chat_data['current_poll_id']:
+                logger.info(f"Создаем первое голосование в чате {chat_id}...")
+                await self.create_monday_poll(chat_id)
 
         await self.check_schedule()
 
@@ -1185,6 +1264,7 @@ if __name__ == "__main__":
     print("🚀 Запуск бота для учета посещаемости с системой админов...")
     print(f"📅 Расписание: каждый понедельник в 19:00")
     print(f"👑 Главный админ ID: {MAIN_ADMIN_ID}")
+    print("💡 Каждый чат имеет отдельный список администраторов")
     print("💡 Используйте /help для списка команд")
 
     bot = SimpleAttendanceBot(BOT_TOKEN)

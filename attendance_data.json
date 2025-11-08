@@ -1,14 +1,21 @@
 {
-  "chat_id": -1003205745038,
-  "last_poll_message_id": 191,
-  "current_poll_id": "1762554625",
-  "votes": {
-    "5141893293": {
-      "option": "1",
-      "name": "08.34.2025",
-      "timestamp": "2025-11-08T00:32:53.671707",
-      "username": "ilkogys"
+  "chat_data": {
+    "-1003205745038": {
+      "last_poll_message_id": 269,
+      "current_poll_id": "1762561404",
+      "votes": {
+        "5141893293": {
+          "option": "1",
+          "name": "08.34.2025",
+          "timestamp": "2025-11-08T00:32:53.671707",
+          "username": "ilkogys"
+        }
+      },
+      "admin_users": [
+        2073879359,
+        5180275141
+      ]
     }
   },
-  "last_updated": "2025-11-08T01:30:25.936754"
+  "last_updated": "2025-11-08T03:24:25.499447"
 }
