@@ -850,13 +850,12 @@ class ModerationCommands:
             else:
                 user_id = int(context.args[0])
 
-            # Размут
+            # Размут - используем только совместимые параметры
             await context.bot.restrict_chat_member(
                 chat_id=chat_id,
                 user_id=user_id,
                 permissions=ChatPermissions(
                     can_send_messages=True,
-                    can_send_media_messages=True,
                     can_send_other_messages=True,
                     can_add_web_page_previews=True
                 )
@@ -877,6 +876,190 @@ class ModerationCommands:
 
         except Exception as e:
             await MessageSender.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка размута: {e}")
+
+    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Бан пользователя"""
+        if not await self.permission_manager.check_admin_access(update, context):
+            return
+
+        if not context.args and not update.message.reply_to_message:
+            await MessageSender.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ <b>Использование:</b>\n"
+                "<code>/ban ID</code> - бан навсегда\n"
+                "<code>/ban ID 1h</code> - бан на 1 час\n\n"
+                "💡 <i>Или ответьте на сообщение командой /ban</i>"
+            )
+            return
+
+        try:
+            chat_id = update.effective_chat.id
+
+            if update.message.reply_to_message:
+                user_to_ban = update.message.reply_to_message.from_user
+                user_id = user_to_ban.id
+                duration_str = context.args[0] if context.args else "forever"
+            else:
+                user_id = int(context.args[0])
+                duration_str = context.args[1] if len(context.args) > 1 else "forever"
+
+            # Парсим время
+            until_date = None
+            if duration_str != "forever":
+                duration = self.time_manager.parse_duration(duration_str)
+                if not duration:
+                    await MessageSender.send_safe_message(
+                        context, chat_id,
+                        "❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w"
+                    )
+                    return
+                until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
+
+            # Проверки
+            if user_id == context.bot.id:
+                await MessageSender.send_safe_message(context, chat_id, "❌ Не могу забанить самого себя!")
+                return
+
+            if await self.permission_manager.is_admin(chat_id, user_id):
+                await MessageSender.send_safe_message(context, chat_id, "❌ Нельзя забанить администратора бота!")
+                return
+
+            # Выполняем бан
+            await context.bot.ban_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                until_date=until_date
+            )
+
+            # Получаем имя пользователя
+            try:
+                user = await context.bot.get_chat(user_id)
+                user_name = user.full_name
+            except:
+                user_name = f"Пользователь ({user_id})"
+
+            if until_date:
+                duration_text = f"на {self.time_manager.format_duration(duration)}"
+                until_text = f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}"
+            else:
+                duration_text = "навсегда"
+                until_text = "⏰ Навсегда"
+
+            await MessageSender.send_safe_message(
+                context, chat_id,
+                f"🚫 <b>{user_name} забанен {duration_text}</b>\n\n"
+                f"{until_text}\n"
+                f"🆔 ID: <code>{user_id}</code>"
+            )
+
+        except Exception as e:
+            await MessageSender.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка бана: {e}")
+
+    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Разбан пользователя"""
+        if not await self.permission_manager.check_admin_access(update, context):
+            return
+
+        if not context.args and not update.message.reply_to_message:
+            await MessageSender.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ <b>Использование:</b>\n"
+                "<code>/unban ID</code> - разбанить по ID\n\n"
+                "💡 <i>Или ответьте на сообщение командой /unban</i>"
+            )
+            return
+
+        try:
+            chat_id = update.effective_chat.id
+
+            if update.message.reply_to_message:
+                user_id = update.message.reply_to_message.from_user.id
+            else:
+                user_id = int(context.args[0])
+
+            # Выполняем разбан
+            await context.bot.unban_chat_member(
+                chat_id=chat_id,
+                user_id=user_id
+            )
+
+            # Получаем имя пользователя
+            try:
+                user = await context.bot.get_chat(user_id)
+                user_name = user.full_name
+            except:
+                user_name = f"Пользователь ({user_id})"
+
+            await MessageSender.send_safe_message(
+                context, chat_id,
+                f"✅ <b>{user_name} разбанен</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>"
+            )
+
+        except Exception as e:
+            await MessageSender.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка разбана: {e}")
+
+    async def kick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Кик пользователя"""
+        if not await self.permission_manager.check_admin_access(update, context):
+            return
+
+        if not context.args and not update.message.reply_to_message:
+            await MessageSender.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ <b>Использование:</b>\n"
+                "<code>/kick ID</code> - кикнуть по ID\n\n"
+                "💡 <i>Или ответьте на сообщение командой /kick</i>"
+            )
+            return
+
+        try:
+            chat_id = update.effective_chat.id
+
+            if update.message.reply_to_message:
+                user_id = update.message.reply_to_message.from_user.id
+            else:
+                user_id = int(context.args[0])
+
+            # Проверки
+            if user_id == context.bot.id:
+                await MessageSender.send_safe_message(context, chat_id, "❌ Не могу кикнуть самого себя!")
+                return
+
+            if await self.permission_manager.is_admin(chat_id, user_id):
+                await MessageSender.send_safe_message(context, chat_id, "❌ Нельзя кикнуть администратора бота!")
+                return
+
+            # Выполняем кик (бан на 30 секунд + разбан)
+            until_date = datetime.now(timezone.utc) + timedelta(seconds=30)
+            await context.bot.ban_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                until_date=until_date
+            )
+
+            # Сразу разбаниваем, чтобы пользователь мог вернуться по приглашению
+            await context.bot.unban_chat_member(
+                chat_id=chat_id,
+                user_id=user_id
+            )
+
+            # Получаем имя пользователя
+            try:
+                user = await context.bot.get_chat(user_id)
+                user_name = user.full_name
+            except:
+                user_name = f"Пользователь ({user_id})"
+
+            await MessageSender.send_safe_message(
+                context, chat_id,
+                f"👢 <b>{user_name} кикнут из чата</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"💡 <i>Пользователь может вернуться по приглашению</i>"
+            )
+
+        except Exception as e:
+            await MessageSender.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка кика: {e}")
 
 
 class AdvancedAdminBot:
@@ -921,6 +1104,26 @@ class AdvancedAdminBot:
         # Команды модерации
         self.application.add_handler(CommandHandler("mute", self.moderation_commands.mute_command))
         self.application.add_handler(CommandHandler("unmute", self.moderation_commands.unmute_command))
+        self.application.add_handler(CommandHandler("ban", self.moderation_commands.ban_command))
+        self.application.add_handler(CommandHandler("unban", self.moderation_commands.unban_command))
+        self.application.add_handler(CommandHandler("kick", self.moderation_commands.kick_command))
+
+        # Обработчики ответов на сообщения
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/mute\b'), self.handle_reply_mute))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/unmute\b'), self.handle_reply_unmute))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/ban\b'), self.handle_reply_ban))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/unban\b'), self.handle_reply_unban))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/kick\b'), self.handle_reply_kick))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/add_admin\b'), self.handle_reply_add_admin))
+        self.application.add_handler(
+            MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/remove_admin\b'),
+                           self.handle_reply_remove_admin))
 
         # Обработчик callback-ов для панели администратора
         self.application.add_handler(CallbackQueryHandler(
@@ -930,6 +1133,34 @@ class AdvancedAdminBot:
 
         # Обработчик ошибок
         self.application.add_error_handler(self.error_handler)
+
+    async def handle_reply_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик мута по ответу на сообщение"""
+        await self.moderation_commands.mute_command(update, context)
+
+    async def handle_reply_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик размута по ответу на сообщение"""
+        await self.moderation_commands.unmute_command(update, context)
+
+    async def handle_reply_ban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик бана по ответу на сообщение"""
+        await self.moderation_commands.ban_command(update, context)
+
+    async def handle_reply_unban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик разбана по ответу на сообщение"""
+        await self.moderation_commands.unban_command(update, context)
+
+    async def handle_reply_kick(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик кика по ответу на сообщение"""
+        await self.moderation_commands.kick_command(update, context)
+
+    async def handle_reply_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик добавления админа по ответу на сообщение"""
+        await self.admin_commands.add_admin_command(update, context)
+
+    async def handle_reply_remove_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик удаления админа по ответу на сообщение"""
+        await self.admin_commands.remove_admin_command(update, context)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
