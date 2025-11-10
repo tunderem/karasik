@@ -1,8 +1,8 @@
 {
   "chat_data": {
     "-1003205745038": {
-      "last_poll_message_id": 269,
-      "current_poll_id": "1762561404",
+      "last_poll_message_id": 282,
+      "current_poll_id": "1762790401",
       "votes": {
         "5141893293": {
           "option": "1",
@@ -15,7 +15,16 @@
         2073879359,
         5180275141
       ]
+    },
+    "-1002919624785": {
+      "last_poll_message_id": 6229,
+      "current_poll_id": "1762790430",
+      "votes": {},
+      "admin_users": [
+        2073879359
+      ],
+      "last_updated": "2025-11-10T19:00:30.588214"
     }
   },
-  "last_updated": "2025-11-08T03:24:25.499447"
+  "last_updated": "2025-11-10T19:00:31.150478"
 }
