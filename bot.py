@@ -7,7 +7,6 @@ import time
 import json
 import os
 from datetime import datetime, timedelta, timezone
-import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,8 +24,10 @@ class AdvancedAdminBot:
         self.token = token
         # Основная структура данных с разделением по chat_id
         self.chat_data = {}
-        self.notification_tasks = {}
         self.application = Application.builder().token(token).build()
+
+        # Загружаем данные сразу при создании
+        self.load_data()
 
         # Обработчики команд
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -48,17 +49,9 @@ class AdvancedAdminBot:
         # Команды мута, бана и кика
         self.application.add_handler(CommandHandler("mute", self.mute_command))
         self.application.add_handler(CommandHandler("unmute", self.unmute_command))
-        self.application.add_handler(CommandHandler("mutelist", self.mute_list_command))
         self.application.add_handler(CommandHandler("ban", self.ban_command))
         self.application.add_handler(CommandHandler("unban", self.unban_command))
-        self.application.add_handler(CommandHandler("banlist", self.ban_list_command))
         self.application.add_handler(CommandHandler("kick", self.kick_command))
-
-        # Команды уведомлений
-        self.application.add_handler(CommandHandler("add_notify", self.add_notify_command))
-        self.application.add_handler(CommandHandler("remove_notify", self.remove_notify_command))
-        self.application.add_handler(CommandHandler("notify_list", self.notify_list_command))
-        self.application.add_handler(CommandHandler("test_notify", self.test_notify_command))
 
         # Обработчик ответов на сообщения
         self.application.add_handler(
@@ -77,13 +70,28 @@ class AdvancedAdminBot:
             MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r'^/remove_admin\b'),
                            self.handle_reply_remove_admin))
 
+        # Обработчик ошибок
+        self.application.add_error_handler(self.error_handler)
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ошибок"""
+        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+
+        try:
+            # Пытаемся отправить сообщение об ошибке
+            if update and update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Произошла ошибка при обработке команды. Попробуйте еще раз."
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения об ошибке: {e}")
+
     def get_chat_data(self, chat_id):
         """Получает данные чата, создает если нет"""
         if chat_id not in self.chat_data:
             self.chat_data[chat_id] = {
                 'admin_users': [MAIN_ADMIN_ID],  # Главный админ всегда в списке
-                'notifications': {},
-                'banned_users': {},
                 'last_updated': datetime.now().isoformat()
             }
         return self.chat_data[chat_id]
@@ -127,21 +135,50 @@ class AdvancedAdminBot:
         chat_data = self.get_chat_data(chat_id)
         return user_id in chat_data['admin_users']
 
-    async def check_admin_access(self, update: Update):
+    async def check_admin_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Проверяет права администратора в текущем чате"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
 
         if not await self.is_admin(chat_id, user_id):
-            await update.message.reply_text("🚫 У вас нет прав администратора в этом чате!")
+            await self.send_safe_message(
+                context, chat_id,
+                "🚫 У вас нет прав администратора в этом чате!"
+            )
             return False
         return True
+
+    async def send_safe_message(self, context, chat_id, text, parse_mode='HTML', reply_to_message_id=None):
+        """Безопасная отправка сообщения с обработкой ошибок"""
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_to_message_id=reply_to_message_id
+            )
+            return True
+        except BadRequest as e:
+            if "Message to be replied not found" in str(e):
+                # Если сообщение для ответа не найдено, отправляем без ответа
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=parse_mode
+                )
+                return True
+            else:
+                logger.error(f"Ошибка отправки сообщения: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения: {e}")
+            return False
 
     # ========== КОМАНДЫ УПРАВЛЕНИЯ АДМИНАМИ ==========
 
     async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает список администраторов текущего чата"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         chat_id = update.effective_chat.id
@@ -149,7 +186,7 @@ class AdvancedAdminBot:
         admin_users = chat_data['admin_users']
 
         if not admin_users:
-            await update.message.reply_text("📝 <b>Список администраторов пуст</b>", parse_mode='HTML')
+            await self.send_safe_message(context, chat_id, "📝 <b>Список администраторов пуст</b>")
             return
 
         admin_list = []
@@ -178,20 +215,20 @@ class AdvancedAdminBot:
         text = f"👑 <b>Администраторы чата:</b>\n\n" + "\n".join(admin_list)
         text += f"\n\n📊 <b>Всего:</b> {len(admin_users)} администраторов"
 
-        await update.message.reply_text(text, parse_mode='HTML')
+        await self.send_safe_message(context, chat_id, text)
 
     async def add_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Добавляет администратора в текущий чат"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         # Если нет аргументов и нет ответа на сообщение
         if not context.args and not update.message.reply_to_message:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/add_admin 123456789</code> - добавить по ID\n\n"
-                "💡 <i>Или ответьте на сообщение пользователя с командой /add_admin</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение пользователя с командой /add_admin</i>"
             )
             return
 
@@ -216,11 +253,11 @@ class AdvancedAdminBot:
 
             # Проверяем, не добавлен ли уже
             if user_id in chat_data['admin_users']:
-                await update.message.reply_text(
+                await self.send_safe_message(
+                    context, chat_id,
                     f"ℹ️ <b>Пользователь уже является администратором этого чата</b>\n\n"
                     f"👤 {user_name}\n"
-                    f"🆔 <code>{user_id}</code>",
-                    parse_mode='HTML'
+                    f"🆔 <code>{user_id}</code>"
                 )
                 return
 
@@ -228,31 +265,37 @@ class AdvancedAdminBot:
             chat_data['admin_users'].append(user_id)
             self.save_data()
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"✅ <b>Новый администратор добавлен в этот чат</b>\n\n"
                 f"👤 {user_name}\n"
                 f"🆔 <code>{user_id}</code>\n\n"
-                f"💡 <i>Теперь пользователь может использовать команды администратора в этом чате</i>",
-                parse_mode='HTML'
+                f"💡 <i>Теперь пользователь может использовать команды администратора в этом чате</i>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID."
+            )
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка добавления: {e}")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                f"❌ Ошибка добавления: {e}"
+            )
 
     async def remove_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Удаляет администратора из текущего чата"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         # Если нет аргументов и нет ответа на сообщение
         if not context.args and not update.message.reply_to_message:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/remove_admin 123456789</code> - удалить по ID\n\n"
-                "💡 <i>Или ответьте на сообщение пользователя с командой /remove_admin</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение пользователя с командой /remove_admin</i>"
             )
             return
 
@@ -277,30 +320,42 @@ class AdvancedAdminBot:
 
             # Проверяем, не пытаемся ли удалить главного администратора
             if user_id == MAIN_ADMIN_ID:
-                await update.message.reply_text("❌ Нельзя удалить главного администратора!")
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ Нельзя удалить главного администратора!"
+                )
                 return
 
             # Проверяем, есть ли пользователь в списке
             if user_id not in chat_data['admin_users']:
-                await update.message.reply_text("❌ Пользователь не является администратором этого чата")
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ Пользователь не является администратором этого чата"
+                )
                 return
 
             # Удаляем администратора
             chat_data['admin_users'].remove(user_id)
             self.save_data()
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"✅ <b>Администратор удален из этого чата</b>\n\n"
                 f"👤 {user_name}\n"
                 f"🆔 <code>{user_id}</code>\n\n"
-                f"💡 <i>Пользователь больше не может использовать команды администратора в этом чате</i>",
-                parse_mode='HTML'
+                f"💡 <i>Пользователь больше не может использовать команды администратора в этом чате</i>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID."
+            )
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка удаления: {e}")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                f"❌ Ошибка удаления: {e}"
+            )
 
     # ========== КОМАНДЫ ДЛЯ ПОЛУЧЕНИЯ ID ==========
 
@@ -312,24 +367,24 @@ class AdvancedAdminBot:
 
         admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
 
-        await update.message.reply_text(
+        await self.send_safe_message(
+            context, chat_id,
             f"👤 <b>Ваша информация:</b>\n\n"
             f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
             f"📛 <b>Имя:</b> {user.full_name}\n"
             f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
             f"💬 <b>ID чата:</b> <code>{chat_id}</code>\n"
-            f"🎯 <b>Статус в этом чате:</b> {admin_status}",
-            parse_mode='HTML'
+            f"🎯 <b>Статус в этом чате:</b> {admin_status}"
         )
 
     async def get_id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Получает ID пользователя по ответу на сообщение"""
         if not context.args and not update.message.reply_to_message:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/get_id</code> - в ответ на сообщение пользователя\n"
-                "<code>/get_id 123456789</code> - по ID",
-                parse_mode='HTML'
+                "<code>/get_id 123456789</code> - по ID"
             )
             return
 
@@ -337,12 +392,12 @@ class AdvancedAdminBot:
             if update.message.reply_to_message:
                 # Получаем ID из ответа на сообщение
                 user = update.message.reply_to_message.from_user
-                await update.message.reply_text(
+                await self.send_safe_message(
+                    context, update.effective_chat.id,
                     f"👤 <b>Информация о пользователе:</b>\n\n"
                     f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
                     f"📛 <b>Имя:</b> {user.full_name}\n"
-                    f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}",
-                    parse_mode='HTML'
+                    f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}"
                 )
             elif context.args:
                 target = context.args[0]
@@ -353,22 +408,31 @@ class AdvancedAdminBot:
                     try:
                         # Пробуем получить информацию о пользователе
                         user = await context.bot.get_chat(user_id)
-                        await update.message.reply_text(
+                        await self.send_safe_message(
+                            context, update.effective_chat.id,
                             f"👤 <b>Информация о пользователе:</b>\n\n"
                             f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
                             f"📛 <b>Имя:</b> {user.full_name}\n"
-                            f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}",
-                            parse_mode='HTML'
+                            f"🔖 <b>Username:</b> @{user.username if user.username else 'нет'}"
                         )
                         return
                     except Exception as e:
-                        await update.message.reply_text(f"❌ Пользователь с ID {target} не найден")
+                        await self.send_safe_message(
+                            context, update.effective_chat.id,
+                            f"❌ Пользователь с ID {target} не найден"
+                        )
                         return
 
-                await update.message.reply_text("❌ Используйте числовой ID пользователя")
+                await self.send_safe_message(
+                    context, update.effective_chat.id,
+                    "❌ Используйте числовой ID пользователя"
+                )
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                f"❌ Ошибка: {e}"
+            )
 
     async def all_ids_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает ID всех администраторов чата"""
@@ -377,7 +441,7 @@ class AdvancedAdminBot:
             admins = await context.bot.get_chat_administrators(chat_id)
 
             if not admins:
-                await update.message.reply_text("❌ Не удалось получить список администраторов")
+                await self.send_safe_message(context, chat_id, "❌ Не удалось получить список администраторов")
                 return
 
             admin_list = []
@@ -394,10 +458,10 @@ class AdvancedAdminBot:
                 admin_list.append(admin_info)
 
             text = "👥 <b>Администраторы чата:</b>\n\n" + "\n".join(admin_list)
-            await update.message.reply_text(text, parse_mode='HTML')
+            await self.send_safe_message(context, chat_id, text)
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка: {e}")
 
     async def chat_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает информацию о чате"""
@@ -407,69 +471,94 @@ class AdvancedAdminBot:
             chat_data = self.get_chat_data(chat_id)
 
             admin_count = len(chat_data['admin_users'])
-            notify_count = len(chat_data.get('notifications', {}))
-            ban_count = len(chat_data.get('banned_users', {}))
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"💬 <b>Информация о чате:</b>\n\n"
                 f"📛 <b>Название:</b> {chat.title}\n"
                 f"🆔 <b>ID чата:</b> <code>{chat.id}</code>\n"
                 f"👥 <b>Тип:</b> {chat.type}\n"
-                f"👑 <b>Админов бота:</b> {admin_count}\n"
-                f"🔔 <b>Уведомлений:</b> {notify_count}\n"
-                f"🚫 <b>Забанено:</b> {ban_count}",
-                parse_mode='HTML'
+                f"👑 <b>Админов бота:</b> {admin_count}"
             )
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка: {e}")
 
     # ========== КОМАНДЫ МУТА, БАНА И КИКА ==========
 
     async def mute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Мут пользователя по ID"""
-        if not await self.check_admin_access(update):
+        """Мут пользователя по ID или по ответу на сообщение"""
+        if not await self.check_admin_access(update, context):
             return
 
+        # Если ответ на сообщение
+        if update.message.reply_to_message:
+            await self.handle_reply_mute(update, context)
+            return
+
+        # Если нет аргументов
         if not context.args:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/mute 123456789</code> - мут по ID\n"
                 "<code>/mute 123456789 1h</code> - мут на 1 час\n\n"
-                "💡 <i>Или ответьте на сообщение командой /mute</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>"
             )
             return
 
         try:
             chat_id = update.effective_chat.id
 
-            # Получаем ID и время
-            target_id = context.args[0]
-            duration_str = context.args[1] if len(context.args) > 1 else "10m"
+            # Определяем ID пользователя и время
+            if len(context.args) >= 1:
+                # Проверяем, является ли первый аргумент ID (числом)
+                if context.args[0].isdigit():
+                    user_id = int(context.args[0])
+                    duration_str = context.args[1] if len(context.args) > 1 else "10m"
+                else:
+                    # Если первый аргумент не число, значит это время, но без ID - ошибка
+                    await self.send_safe_message(
+                        context, chat_id,
+                        "❌ <b>Не указан ID пользователя!</b>\n\n"
+                        "📝 <b>Использование:</b>\n"
+                        "<code>/mute 123456789 1h</code> - мут по ID\n\n"
+                        "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>"
+                    )
+                    return
+            else:
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ <b>Не указан ID пользователя!</b>\n\n"
+                    "📝 <b>Использование:</b>\n"
+                    "<code>/mute 123456789 1h</code> - мут по ID\n\n"
+                    "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>"
+                )
+                return
 
             # Парсим время
             duration = self.parse_duration(duration_str)
             if not duration:
-                await update.message.reply_text("❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w")
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w"
+                )
                 return
-
-            user_id = int(target_id)
 
             # Проверяем, не пытаемся ли замутить бота или администратора
             if user_id == context.bot.id:
-                await update.message.reply_text("❌ Не могу замутить самого себя!")
+                await self.send_safe_message(context, chat_id, "❌ Не могу замутить самого себя!")
                 return
 
             # Проверяем, является ли пользователь администратором
             if await self.is_admin(chat_id, user_id):
-                await update.message.reply_text("❌ Нельзя замутить администратора бота!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя замутить администратора бота!")
                 return
 
             # Проверяем, является ли пользователь администратором чата
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
                 if chat_member.status in ['administrator', 'creator']:
-                    await update.message.reply_text("❌ Нельзя замутить администратора чата!")
+                    await self.send_safe_message(context, chat_id, "❌ Нельзя замутить администратора чата!")
                     return
             except:
                 pass
@@ -490,37 +579,47 @@ class AdvancedAdminBot:
             except:
                 user_name = f"Пользователь ({user_id})"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"🔇 <b>{user_name} замьючен на {self.format_duration(duration)}</b>\n\n"
                 f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}\n"
-                f"🆔 ID: <code>{user_id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_id}</code>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID.\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /mute</i>"
+            )
         except BadRequest as e:
             error_msg = str(e).lower()
             if "not enough rights" in error_msg:
-                await update.message.reply_text("❌ У бота недостаточно прав для ограничения пользователей")
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для ограничения пользователей")
             elif "user not found" in error_msg:
-                await update.message.reply_text("❌ Пользователь не найден в этом чате")
+                await self.send_safe_message(context, update.effective_chat.id, "❌ Пользователь не найден в этом чате")
             else:
-                await update.message.reply_text(f"❌ Ошибка мута: {e}")
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка мута: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка мута: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка мута: {e}")
 
     async def unmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Размут пользователя по ID"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
+            return
+
+        # Если ответ на сообщение
+        if update.message.reply_to_message:
+            await self.handle_reply_unmute(update, context)
             return
 
         if not context.args:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/unmute 123456789</code> - размутить по ID\n\n"
-                "💡 <i>Или ответьте на сообщение командой /unmute</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение командой /unmute</i>"
             )
             return
 
@@ -548,110 +647,101 @@ class AdvancedAdminBot:
             except:
                 user_name = f"Пользователь ({user_id})"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"🔊 <b>{user_name} размьючен</b>\n\n"
-                f"🆔 ID: <code>{user_id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_id}</code>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID.\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /unmute</i>"
+            )
         except BadRequest as e:
             if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для изменения прав пользователей")
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для изменения прав пользователей")
             else:
-                await update.message.reply_text(f"❌ Ошибка размута: {e}")
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка размута: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка размута: {e}")
-
-    async def mute_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список замьюченных пользователей"""
-        try:
-            chat_id = update.effective_chat.id
-            muted_users = []
-
-            # Получаем администраторов и проверяем их статус
-            admins = await context.bot.get_chat_administrators(chat_id)
-            for admin in admins:
-                user = admin.user
-                try:
-                    chat_member = await context.bot.get_chat_member(chat_id, user.id)
-                    if (chat_member.status == 'restricted' and
-                            not chat_member.permissions.can_send_messages):
-
-                        user_info = f"👤 {user.full_name}"
-                        if user.username:
-                            user_info += f" (@{user.username})"
-                        user_info += f" | ID: <code>{user.id}</code>"
-
-                        if chat_member.until_date:
-                            time_left = chat_member.until_date - datetime.now(timezone.utc)
-                            if time_left.total_seconds() > 0:
-                                user_info += f" | ⏰ {self.format_duration(int(time_left.total_seconds()))}"
-
-                        muted_users.append(user_info)
-                except:
-                    continue
-
-            if muted_users:
-                text = "🔇 <b>Замьюченные пользователи:</b>\n\n" + "\n".join(muted_users)
-            else:
-                text = "✅ <b>Нет замьюченных пользователей</b>"
-
-            await update.message.reply_text(text, parse_mode='HTML')
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка размута: {e}")
 
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Бан пользователя по ID"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
+            return
+
+        # Если ответ на сообщение
+        if update.message.reply_to_message:
+            await self.handle_reply_ban(update, context)
             return
 
         if not context.args:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/ban 123456789</code> - бан по ID\n"
                 "<code>/ban 123456789 1h</code> - бан на 1 час\n\n"
-                "💡 <i>Или ответьте на сообщение командой /ban</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение командой /ban</i>"
             )
             return
 
         try:
             chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
 
             # Получаем ID и время
-            target_id = context.args[0]
-            duration_str = context.args[1] if len(context.args) > 1 else "forever"
+            if len(context.args) >= 1:
+                if context.args[0].isdigit():
+                    user_id = int(context.args[0])
+                    duration_str = context.args[1] if len(context.args) > 1 else "forever"
+                else:
+                    await self.send_safe_message(
+                        context, chat_id,
+                        "❌ <b>Не указан ID пользователя!</b>\n\n"
+                        "📝 <b>Использование:</b>\n"
+                        "<code>/ban 123456789 1h</code> - бан по ID\n\n"
+                        "💡 <i>Или ответьте на сообщение пользователя с командой /ban</i>"
+                    )
+                    return
+            else:
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ <b>Не указан ID пользователя!</b>\n\n"
+                    "📝 <b>Использование:</b>\n"
+                    "<code>/ban 123456789 1h</code> - бан по ID\n\n"
+                    "💡 <i>Или ответьте на сообщение пользователя с командой /ban</i>"
+                )
+                return
 
             # Парсим время
             until_date = None
             if duration_str != "forever":
                 duration = self.parse_duration(duration_str)
                 if not duration:
-                    await update.message.reply_text("❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w")
+                    await self.send_safe_message(
+                        context, chat_id,
+                        "❌ Неверный формат времени. Используйте: 10m, 1h, 1d, 1w"
+                    )
                     return
                 until_date = datetime.now(timezone.utc) + timedelta(seconds=duration)
 
-            user_id = int(target_id)
-
             # Проверяем, не пытаемся ли забанить бота или администратора
             if user_id == context.bot.id:
-                await update.message.reply_text("❌ Не могу забанить самого себя!")
+                await self.send_safe_message(context, chat_id, "❌ Не могу забанить самого себя!")
                 return
 
             # Проверяем, является ли пользователь администратором
             if await self.is_admin(chat_id, user_id):
-                await update.message.reply_text("❌ Нельзя забанить администратора бота!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя забанить администратора бота!")
                 return
 
             # Проверяем, является ли пользователь администратором чата
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
                 if chat_member.status in ['administrator', 'creator']:
-                    await update.message.reply_text("❌ Нельзя забанить администратора чата!")
+                    await self.send_safe_message(context, chat_id, "❌ Нельзя забанить администратора чата!")
                     return
             except:
                 pass
@@ -662,14 +752,6 @@ class AdvancedAdminBot:
                 user_id=user_id,
                 until_date=until_date
             )
-
-            # Сохраняем в список забаненных
-            chat_data['banned_users'][str(user_id)] = {
-                'until': until_date.isoformat() if until_date else 'forever',
-                'banned_at': datetime.now().isoformat(),
-                'banned_by': update.effective_user.id
-            }
-            self.save_data()
 
             # Пробуем получить имя пользователя
             try:
@@ -685,43 +767,52 @@ class AdvancedAdminBot:
                 duration_text = "навсегда"
                 until_text = "⏰ Навсегда"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"🚫 <b>{user_name} забанен {duration_text}</b>\n\n"
                 f"{until_text}\n"
-                f"🆔 ID: <code>{user_id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_id}</code>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID.\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /ban</i>"
+            )
         except BadRequest as e:
             error_msg = str(e).lower()
             if "not enough rights" in error_msg:
-                await update.message.reply_text("❌ У бота недостаточно прав для бана пользователей")
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для бана пользователей")
             elif "user not found" in error_msg:
-                await update.message.reply_text("❌ Пользователь не найден в этом чате")
+                await self.send_safe_message(context, update.effective_chat.id, "❌ Пользователь не найден в этом чате")
             else:
-                await update.message.reply_text(f"❌ Ошибка бана: {e}")
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка бана: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка бана: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка бана: {e}")
 
     async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Разбан пользователя по ID"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
+            return
+
+        # Если ответ на сообщение
+        if update.message.reply_to_message:
+            await self.handle_reply_unban(update, context)
             return
 
         if not context.args:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/unban 123456789</code> - разбанить по ID\n\n"
-                "💡 <i>Или ответьте на сообщение командой /unban</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение командой /unban</i>"
             )
             return
 
         try:
             chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
             user_id = int(context.args[0])
 
             # Выполняем разбан
@@ -730,11 +821,6 @@ class AdvancedAdminBot:
                 user_id=user_id
             )
 
-            # Удаляем из списка забаненных
-            if str(user_id) in chat_data['banned_users']:
-                del chat_data['banned_users'][str(user_id)]
-                self.save_data()
-
             # Пробуем получить имя пользователя
             try:
                 user = await context.bot.get_chat(user_id)
@@ -742,33 +828,43 @@ class AdvancedAdminBot:
             except:
                 user_name = f"Пользователь ({user_id})"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"✅ <b>{user_name} разбанен</b>\n\n"
-                f"🆔 ID: <code>{user_id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_id}</code>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID.\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /unban</i>"
+            )
         except BadRequest as e:
             if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для разбана пользователей")
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для разбана пользователей")
             else:
-                await update.message.reply_text(f"❌ Ошибка разбана: {e}")
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка разбана: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка разбана: {e}")
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка разбана: {e}")
 
     async def kick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Кик пользователя по ID"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
+            return
+
+        # Если ответ на сообщение
+        if update.message.reply_to_message:
+            await self.handle_reply_kick(update, context)
             return
 
         if not context.args:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, update.effective_chat.id,
                 "❌ <b>Использование:</b>\n"
                 "<code>/kick 123456789</code> - кикнуть по ID\n\n"
-                "💡 <i>Или ответьте на сообщение командой /kick</i>",
-                parse_mode='HTML'
+                "💡 <i>Или ответьте на сообщение командой /kick</i>"
             )
             return
 
@@ -776,24 +872,43 @@ class AdvancedAdminBot:
             chat_id = update.effective_chat.id
 
             # Получаем ID пользователя
-            target_id = context.args[0]
-            user_id = int(target_id)
+            if len(context.args) >= 1:
+                if context.args[0].isdigit():
+                    user_id = int(context.args[0])
+                else:
+                    await self.send_safe_message(
+                        context, chat_id,
+                        "❌ <b>Не указан ID пользователя!</b>\n\n"
+                        "📝 <b>Использование:</b>\n"
+                        "<code>/kick 123456789</code> - кикнуть по ID\n\n"
+                        "💡 <i>Или ответьте на сообщение пользователя с командой /kick</i>"
+                    )
+                    return
+            else:
+                await self.send_safe_message(
+                    context, chat_id,
+                    "❌ <b>Не указан ID пользователя!</b>\n\n"
+                    "📝 <b>Использование:</b>\n"
+                    "<code>/kick 123456789</code> - кикнуть по ID\n\n"
+                    "💡 <i>Или ответьте на сообщение пользователя с командой /kick</i>"
+                )
+                return
 
             # Проверяем, не пытаемся ли кикнуть бота или администратора
             if user_id == context.bot.id:
-                await update.message.reply_text("❌ Не могу кикнуть самого себя!")
+                await self.send_safe_message(context, chat_id, "❌ Не могу кикнуть самого себя!")
                 return
 
             # Проверяем, является ли пользователь администратором
             if await self.is_admin(chat_id, user_id):
-                await update.message.reply_text("❌ Нельзя кикнуть администратора бота!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя кикнуть администратора бота!")
                 return
 
             # Проверяем, является ли пользователь администратором чата
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
                 if chat_member.status in ['administrator', 'creator']:
-                    await update.message.reply_text("❌ Нельзя кикнуть администратора чата!")
+                    await self.send_safe_message(context, chat_id, "❌ Нельзя кикнуть администратора чата!")
                     return
             except:
                 pass
@@ -819,283 +934,36 @@ class AdvancedAdminBot:
             except:
                 user_name = f"Пользователь ({user_id})"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"👢 <b>{user_name} кикнут из чата</b>\n\n"
                 f"🆔 ID: <code>{user_id}</code>\n"
-                f"💡 <i>Пользователь может вернуться по приглашению</i>",
-                parse_mode='HTML'
+                f"💡 <i>Пользователь может вернуться по приглашению</i>"
             )
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат ID. Используйте числовой ID.")
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                "❌ Неверный формат ID. Используйте числовой ID.\n\n"
+                "💡 <i>Или ответьте на сообщение пользователя с командой /kick</i>"
+            )
         except BadRequest as e:
             error_msg = str(e).lower()
             if "not enough rights" in error_msg:
-                await update.message.reply_text("❌ У бота недостаточно прав для кика пользователей")
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для кика пользователей")
             elif "user not found" in error_msg:
-                await update.message.reply_text("❌ Пользователь не найден в этом чате")
+                await self.send_safe_message(context, update.effective_chat.id, "❌ Пользователь не найден в этом чате")
             else:
-                await update.message.reply_text(f"❌ Ошибка кика: {e}")
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка кика: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка кика: {e}")
-
-    async def ban_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список забаненных пользователей"""
-        try:
-            chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
-            banned_users = chat_data.get('banned_users', {})
-
-            if not banned_users:
-                await update.message.reply_text("✅ <b>Нет забаненных пользователей</b>", parse_mode='HTML')
-                return
-
-            ban_list = []
-            for i, (user_id, ban_info) in enumerate(banned_users.items(), 1):
-                try:
-                    user = await context.bot.get_chat(int(user_id))
-                    user_name = user.full_name
-                    if user.username:
-                        user_name += f" (@{user.username})"
-                except:
-                    user_name = f"Пользователь ({user_id})"
-
-                ban_time = datetime.fromisoformat(ban_info['banned_at']).strftime('%d.%m.%Y %H:%M')
-
-                if ban_info['until'] == 'forever':
-                    duration = "навсегда"
-                else:
-                    until_date = datetime.fromisoformat(ban_info['until'])
-                    duration = f"до {until_date.strftime('%d.%m.%Y %H:%M')}"
-
-                ban_list.append(f"{i}. {user_name}\n   🆔 <code>{user_id}</code>\n   ⏰ {duration}\n   📅 {ban_time}")
-
-            text = "🚫 <b>Забаненные пользователи:</b>\n\n" + "\n\n".join(ban_list)
-            await update.message.reply_text(text, parse_mode='HTML')
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
-
-    # ========== КОМАНДЫ УВЕДОМЛЕНИЙ ==========
-
-    async def add_notify_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Добавляет периодическое уведомление"""
-        if not await self.check_admin_access(update):
-            return
-
-        if len(context.args) < 2:
-            await update.message.reply_text(
-                "❌ <b>Использование:</b>\n"
-                "<code>/add_notify 1h Текст уведомления</code>\n\n"
-                "💡 <b>Примеры интервалов:</b>\n"
-                "<code>30m</code> - каждые 30 минут\n"
-                "<code>2h</code> - каждые 2 часа\n"
-                "<code>1d</code> - каждый день\n"
-                "<code>1w</code> - каждую неделю",
-                parse_mode='HTML'
-            )
-            return
-
-        try:
-            chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
-
-            interval_str = context.args[0]
-            message_text = ' '.join(context.args[1:])
-
-            # Парсим интервал
-            interval = self.parse_duration(interval_str)
-            if not interval or interval < 60:
-                await update.message.reply_text(
-                    "❌ Неверный формат интервала. Минимальный интервал - 1 минута\n\n"
-                    "💡 <b>Примеры:</b>\n"
-                    "<code>30m</code> - 30 минут\n"
-                    "<code>2h</code> - 2 часа\n"
-                    "<code>1d</code> - 1 день",
-                    parse_mode='HTML'
-                )
-                return
-
-            # Создаем уведомление
-            notify_id = str(int(datetime.now().timestamp()))
-            chat_data['notifications'][notify_id] = {
-                'interval': interval,
-                'message': message_text,
-                'last_sent': None,
-                'created_at': datetime.now().isoformat(),
-                'created_by': update.effective_user.id
-            }
-
-            self.save_data()
-            await self.start_notification_task(chat_id, notify_id)
-
-            await update.message.reply_text(
-                f"🔔 <b>Уведомление добавлено!</b>\n\n"
-                f"📝 <b>Текст:</b> {message_text}\n"
-                f"⏰ <b>Интервал:</b> {self.format_duration(interval)}\n"
-                f"🆔 <b>ID уведомления:</b> <code>{notify_id}</code>\n\n"
-                f"💡 <i>Используйте /notify_list для просмотра всех уведомлений</i>",
-                parse_mode='HTML'
-            )
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка добавления уведомления: {e}")
-
-    async def remove_notify_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удаляет уведомление"""
-        if not await self.check_admin_access(update):
-            return
-
-        if not context.args:
-            await update.message.reply_text(
-                "❌ <b>Использование:</b>\n"
-                "<code>/remove_notify ID_уведомления</code>\n\n"
-                "💡 <i>ID уведомления можно посмотреть в /notify_list</i>",
-                parse_mode='HTML'
-            )
-            return
-
-        try:
-            chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
-            notify_id = context.args[0]
-
-            if notify_id not in chat_data['notifications']:
-                await update.message.reply_text("❌ Уведомление с таким ID не найдено")
-                return
-
-            # Удаляем уведомление
-            del chat_data['notifications'][notify_id]
-            self.save_data()
-
-            # Останавливаем задачу если она запущена
-            task_key = f"{chat_id}_{notify_id}"
-            if task_key in self.notification_tasks:
-                self.notification_tasks[task_key].cancel()
-                del self.notification_tasks[task_key]
-
-            await update.message.reply_text("✅ Уведомление удалено!")
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка удаления уведомления: {e}")
-
-    async def notify_list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список уведомлений"""
-        if not await self.check_admin_access(update):
-            return
-
-        try:
-            chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
-            notifications = chat_data.get('notifications', {})
-
-            if not notifications:
-                await update.message.reply_text("📭 <b>Нет активных уведомлений</b>", parse_mode='HTML')
-                return
-
-            notify_list = []
-            for notify_id, notify_data in notifications.items():
-                interval = self.format_duration(notify_data['interval'])
-                created_at = datetime.fromisoformat(notify_data['created_at']).strftime('%d.%m.%Y %H:%M')
-                message_preview = notify_data['message'][:50] + "..." if len(notify_data['message']) > 50 else \
-                notify_data['message']
-
-                notify_list.append(
-                    f"🔔 <b>ID:</b> <code>{notify_id}</code>\n"
-                    f"⏰ <b>Интервал:</b> {interval}\n"
-                    f"📝 <b>Текст:</b> {message_preview}\n"
-                    f"📅 <b>Создано:</b> {created_at}\n"
-                )
-
-            text = "🔔 <b>Активные уведомления:</b>\n\n" + "\n".join(notify_list)
-            await update.message.reply_text(text, parse_mode='HTML')
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
-
-    async def test_notify_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Тестирует уведомление"""
-        if not await self.check_admin_access(update):
-            return
-
-        if not context.args:
-            await update.message.reply_text(
-                "❌ <b>Использование:</b>\n"
-                "<code>/test_notify ID_уведомления</code>\n\n"
-                "💡 <i>Отправляет тестовое уведомление</i>",
-                parse_mode='HTML'
-            )
-            return
-
-        try:
-            chat_id = update.effective_chat.id
-            chat_data = self.get_chat_data(chat_id)
-            notify_id = context.args[0]
-
-            if notify_id not in chat_data['notifications']:
-                await update.message.reply_text("❌ Уведомление с таким ID не найдено")
-                return
-
-            notify_data = chat_data['notifications'][notify_id]
-            await update.message.reply_text(
-                f"🔔 <b>Тестовое уведомление:</b>\n\n{notify_data['message']}",
-                parse_mode='HTML'
-            )
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка тестирования уведомления: {e}")
-
-    async def start_notification_task(self, chat_id, notify_id):
-        """Запускает задачу уведомления"""
-        chat_data = self.get_chat_data(chat_id)
-        if notify_id not in chat_data['notifications']:
-            return
-
-        notify_data = chat_data['notifications'][notify_id]
-        task_key = f"{chat_id}_{notify_id}"
-
-        async def notification_worker():
-            while True:
-                try:
-                    # Проверяем что уведомление еще существует
-                    current_chat_data = self.get_chat_data(chat_id)
-                    if notify_id not in current_chat_data['notifications']:
-                        break
-
-                    # Отправляем уведомление
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔔 <b>Напоминание:</b>\n\n{notify_data['message']}",
-                        parse_mode='HTML'
-                    )
-
-                    # Обновляем время последней отправки
-                    current_chat_data['notifications'][notify_id]['last_sent'] = datetime.now().isoformat()
-                    self.save_data()
-
-                    # Ждем указанный интервал
-                    await asyncio.sleep(notify_data['interval'])
-
-                except Exception as e:
-                    logger.error(f"Ошибка в задаче уведомления {notify_id}: {e}")
-                    await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
-
-        # Запускаем задачу
-        if task_key not in self.notification_tasks:
-            task = asyncio.create_task(notification_worker())
-            self.notification_tasks[task_key] = task
-
-    async def start_all_notification_tasks(self):
-        """Запускает все уведомления при старте бота"""
-        for chat_id, chat_data in self.chat_data.items():
-            for notify_id in chat_data.get('notifications', {}).keys():
-                await self.start_notification_task(chat_id, notify_id)
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка кика: {e}")
 
     # ========== ОБРАБОТЧИКИ ОТВЕТОВ НА СООБЩЕНИЯ ==========
 
     async def handle_reply_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Мут по ответу на сообщение"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         replied_message = update.message.reply_to_message
@@ -1107,18 +975,18 @@ class AdvancedAdminBot:
 
         # Проверяем, не пытаемся ли замутить бота или администратора
         if user_to_mute.id == context.bot.id:
-            await update.message.reply_text("❌ Не могу замутить самого себя!")
+            await self.send_safe_message(context, chat_id, "❌ Не могу замутить самого себя!")
             return
 
         if await self.is_admin(chat_id, user_to_mute.id):
-            await update.message.reply_text("❌ Нельзя замутить администратора бота!")
+            await self.send_safe_message(context, chat_id, "❌ Нельзя замутить администратора бота!")
             return
 
         try:
             # Проверяем, является ли пользователь администратором чата
             chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_to_mute.id)
             if chat_member.status in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Нельзя замутить администратора чата!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя замутить администратора чата!")
                 return
         except:
             pass
@@ -1138,62 +1006,25 @@ class AdvancedAdminBot:
                 until_date=until_date
             )
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"🔇 <b>{user_to_mute.full_name} замьючен на {self.format_duration(duration)}</b>\n\n"
                 f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}\n"
-                f"🆔 ID: <code>{user_to_mute.id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_to_mute.id}</code>"
             )
 
         except BadRequest as e:
             if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для ограничения пользователей")
+                await self.send_safe_message(context, chat_id,
+                                             "❌ У бота недостаточно прав для ограничения пользователей")
             else:
-                await update.message.reply_text(f"❌ Ошибка мута: {e}")
+                await self.send_safe_message(context, chat_id, f"❌ Ошибка мута: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка мута: {e}")
-
-    async def handle_reply_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Размут по ответу на сообщение"""
-        if not await self.check_admin_access(update):
-            return
-
-        replied_message = update.message.reply_to_message
-        if not replied_message:
-            return
-
-        user_to_unmute = replied_message.from_user
-
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=user_to_unmute.id,
-                permissions=ChatPermissions(
-                    can_send_messages=True,
-                    can_send_media_messages=True,
-                    can_send_polls=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True
-                )
-            )
-
-            await update.message.reply_text(
-                f"🔊 <b>{user_to_unmute.full_name} размьючен</b>\n\n"
-                f"🆔 ID: <code>{user_to_unmute.id}</code>",
-                parse_mode='HTML'
-            )
-
-        except BadRequest as e:
-            if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для изменения прав пользователей")
-            else:
-                await update.message.reply_text(f"❌ Ошибка размута: {e}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка размута: {e}")
+            await self.send_safe_message(context, chat_id, f"❌ Ошибка мута: {e}")
 
     async def handle_reply_ban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Бан по ответу на сообщение"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         replied_message = update.message.reply_to_message
@@ -1202,22 +1033,21 @@ class AdvancedAdminBot:
 
         user_to_ban = replied_message.from_user
         chat_id = update.effective_chat.id
-        chat_data = self.get_chat_data(chat_id)
 
         # Проверяем, не пытаемся ли забанить бота или администратора
         if user_to_ban.id == context.bot.id:
-            await update.message.reply_text("❌ Не могу забанить самого себя!")
+            await self.send_safe_message(context, chat_id, "❌ Не могу забанить самого себя!")
             return
 
         if await self.is_admin(chat_id, user_to_ban.id):
-            await update.message.reply_text("❌ Нельзя забанить администратора бота!")
+            await self.send_safe_message(context, chat_id, "❌ Нельзя забанить администратора бота!")
             return
 
         try:
             # Проверяем, является ли пользователь администратором чата
             chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_to_ban.id)
             if chat_member.status in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Нельзя забанить администратора чата!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя забанить администратора чата!")
                 return
         except:
             pass
@@ -1239,14 +1069,6 @@ class AdvancedAdminBot:
                 until_date=until_date
             )
 
-            # Сохраняем в список забаненных
-            chat_data['banned_users'][str(user_to_ban.id)] = {
-                'until': until_date.isoformat() if until_date else 'forever',
-                'banned_at': datetime.now().isoformat(),
-                'banned_by': update.effective_user.id
-            }
-            self.save_data()
-
             if until_date:
                 duration_text = f"на {self.format_duration(duration)}"
                 until_text = f"⏰ До: {until_date.strftime('%d.%m.%Y %H:%M:%S')}"
@@ -1254,62 +1076,24 @@ class AdvancedAdminBot:
                 duration_text = "навсегда"
                 until_text = "⏰ Навсегда"
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"🚫 <b>{user_to_ban.full_name} забанен {duration_text}</b>\n\n"
                 f"{until_text}\n"
-                f"🆔 ID: <code>{user_to_ban.id}</code>",
-                parse_mode='HTML'
+                f"🆔 ID: <code>{user_to_ban.id}</code>"
             )
 
         except BadRequest as e:
             if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для бана пользователей")
+                await self.send_safe_message(context, chat_id, "❌ У бота недостаточно прав для бана пользователей")
             else:
-                await update.message.reply_text(f"❌ Ошибка бана: {e}")
+                await self.send_safe_message(context, chat_id, f"❌ Ошибка бана: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка бана: {e}")
-
-    async def handle_reply_unban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Разбан по ответу на сообщение"""
-        if not await self.check_admin_access(update):
-            return
-
-        replied_message = update.message.reply_to_message
-        if not replied_message:
-            return
-
-        user_to_unban = replied_message.from_user
-        chat_id = update.effective_chat.id
-        chat_data = self.get_chat_data(chat_id)
-
-        try:
-            await context.bot.unban_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=user_to_unban.id
-            )
-
-            # Удаляем из списка забаненных
-            if str(user_to_unban.id) in chat_data['banned_users']:
-                del chat_data['banned_users'][str(user_to_unban.id)]
-                self.save_data()
-
-            await update.message.reply_text(
-                f"✅ <b>{user_to_unban.full_name} разбанен</b>\n\n"
-                f"🆔 ID: <code>{user_to_unban.id}</code>",
-                parse_mode='HTML'
-            )
-
-        except BadRequest as e:
-            if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для разбана пользователей")
-            else:
-                await update.message.reply_text(f"❌ Ошибка разбана: {e}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка разбана: {e}")
+            await self.send_safe_message(context, chat_id, f"❌ Ошибка бана: {e}")
 
     async def handle_reply_kick(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Кик по ответу на сообщение"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         replied_message = update.message.reply_to_message
@@ -1321,18 +1105,18 @@ class AdvancedAdminBot:
 
         # Проверяем, не пытаемся ли кикнуть бота или администратора
         if user_to_kick.id == context.bot.id:
-            await update.message.reply_text("❌ Не могу кикнуть самого себя!")
+            await self.send_safe_message(context, chat_id, "❌ Не могу кикнуть самого себя!")
             return
 
         if await self.is_admin(chat_id, user_to_kick.id):
-            await update.message.reply_text("❌ Нельзя кикнуть администратора бота!")
+            await self.send_safe_message(context, chat_id, "❌ Нельзя кикнуть администратора бота!")
             return
 
         try:
             # Проверяем, является ли пользователь администратором чата
             chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_to_kick.id)
             if chat_member.status in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Нельзя кикнуть администратора чата!")
+                await self.send_safe_message(context, chat_id, "❌ Нельзя кикнуть администратора чата!")
                 return
         except:
             pass
@@ -1352,24 +1136,24 @@ class AdvancedAdminBot:
                 user_id=user_to_kick.id
             )
 
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"👢 <b>{user_to_kick.full_name} кикнут из чата</b>\n\n"
                 f"🆔 ID: <code>{user_to_kick.id}</code>\n"
-                f"💡 <i>Пользователь может вернуться по приглашению</i>",
-                parse_mode='HTML'
+                f"💡 <i>Пользователь может вернуться по приглашению</i>"
             )
 
         except BadRequest as e:
             if "not enough rights" in str(e).lower():
-                await update.message.reply_text("❌ У бота недостаточно прав для кика пользователей")
+                await self.send_safe_message(context, chat_id, "❌ У бота недостаточно прав для кика пользователей")
             else:
-                await update.message.reply_text(f"❌ Ошибка кика: {e}")
+                await self.send_safe_message(context, chat_id, f"❌ Ошибка кика: {e}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка кика: {e}")
+            await self.send_safe_message(context, chat_id, f"❌ Ошибка кика: {e}")
 
     async def handle_reply_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Добавление админа по ответу на сообщение"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         replied_message = update.message.reply_to_message
@@ -1382,11 +1166,11 @@ class AdvancedAdminBot:
 
         # Проверяем, не добавляем ли уже админа
         if user_to_admin.id in chat_data['admin_users']:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"ℹ️ <b>Пользователь уже является администратором этого чата</b>\n\n"
                 f"👤 {user_to_admin.full_name}\n"
-                f"🆔 <code>{user_to_admin.id}</code>",
-                parse_mode='HTML'
+                f"🆔 <code>{user_to_admin.id}</code>"
             )
             return
 
@@ -1394,17 +1178,17 @@ class AdvancedAdminBot:
         chat_data['admin_users'].append(user_to_admin.id)
         self.save_data()
 
-        await update.message.reply_text(
+        await self.send_safe_message(
+            context, chat_id,
             f"✅ <b>Новый администратор добавлен в этот чат</b>\n\n"
             f"👤 {user_to_admin.full_name}\n"
             f"🆔 <code>{user_to_admin.id}</code>\n\n"
-            f"💡 <i>Теперь пользователь может использовать команды администратора в этом чате</i>",
-            parse_mode='HTML'
+            f"💡 <i>Теперь пользователь может использовать команды администратора в этом чате</i>"
         )
 
     async def handle_reply_remove_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Удаление админа по ответу на сообщение"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         replied_message = update.message.reply_to_message
@@ -1417,25 +1201,96 @@ class AdvancedAdminBot:
 
         # Проверяем, не пытаемся ли удалить главного администратора
         if user_to_remove.id == MAIN_ADMIN_ID:
-            await update.message.reply_text("❌ Нельзя удалить главного администратора!")
+            await self.send_safe_message(context, chat_id, "❌ Нельзя удалить главного администратора!")
             return
 
         # Проверяем, есть ли пользователь в списке
         if user_to_remove.id not in chat_data['admin_users']:
-            await update.message.reply_text("❌ Пользователь не является администратором этого чата")
+            await self.send_safe_message(context, chat_id, "❌ Пользователь не является администратором этого чата")
             return
 
         # Удаляем администратора
         chat_data['admin_users'].remove(user_to_remove.id)
         self.save_data()
 
-        await update.message.reply_text(
+        await self.send_safe_message(
+            context, chat_id,
             f"✅ <b>Администратор удален из этого чата</b>\n\n"
             f"👤 {user_to_remove.full_name}\n"
             f"🆔 <code>{user_to_remove.id}</code>\n\n"
-            f"💡 <i>Пользователь больше не может использовать команды администратора в этом чате</i>",
-            parse_mode='HTML'
+            f"💡 <i>Пользователь больше не может использовать команды администратора в этом чате</i>"
         )
+
+    async def handle_reply_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Размут по ответу на сообщение"""
+        if not await self.check_admin_access(update, context):
+            return
+
+        replied_message = update.message.reply_to_message
+        if not replied_message:
+            return
+
+        user_to_unmute = replied_message.from_user
+
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_to_unmute.id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True
+                )
+            )
+
+            await self.send_safe_message(
+                context, update.effective_chat.id,
+                f"🔊 <b>{user_to_unmute.full_name} размьючен</b>\n\n"
+                f"🆔 ID: <code>{user_to_unmute.id}</code>"
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await self.send_safe_message(context, update.effective_chat.id,
+                                             "❌ У бота недостаточно прав для изменения прав пользователей")
+            else:
+                await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка размута: {e}")
+        except Exception as e:
+            await self.send_safe_message(context, update.effective_chat.id, f"❌ Ошибка размута: {e}")
+
+    async def handle_reply_unban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Разбан по ответу на сообщение"""
+        if not await self.check_admin_access(update, context):
+            return
+
+        replied_message = update.message.reply_to_message
+        if not replied_message:
+            return
+
+        user_to_unban = replied_message.from_user
+        chat_id = update.effective_chat.id
+
+        try:
+            await context.bot.unban_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user_to_unban.id
+            )
+
+            await self.send_safe_message(
+                context, chat_id,
+                f"✅ <b>{user_to_unban.full_name} разбанен</b>\n\n"
+                f"🆔 ID: <code>{user_to_unban.id}</code>"
+            )
+
+        except BadRequest as e:
+            if "not enough rights" in str(e).lower():
+                await self.send_safe_message(context, chat_id, "❌ У бота недостаточно прав для разбана пользователей")
+            else:
+                await self.send_safe_message(context, chat_id, f"❌ Ошибка разбана: {e}")
+        except Exception as e:
+            await self.send_safe_message(context, chat_id, f"❌ Ошибка разбана: {e}")
 
     # ========== СЛУЖЕБНЫЕ МЕТОДЫ ==========
 
@@ -1453,7 +1308,8 @@ class AdvancedAdminBot:
             elif duration_str.endswith('w'):
                 return int(duration_str[:-1]) * 604800
             else:
-                return int(duration_str) * 60  # По умолчанию считаем минутами
+                # Если просто число, считаем минутами
+                return int(duration_str) * 60
         except:
             return None
 
@@ -1480,6 +1336,23 @@ class AdvancedAdminBot:
 
     # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда start"""
+        chat_id = update.effective_chat.id
+        chat_data = self.get_chat_data(chat_id)
+
+        # Активируем бота в чате
+        await self.send_safe_message(
+            context, chat_id,
+            f"✅ <b>Продвинутый бот-администратор активирован!</b>\n\n"
+            f"⚡ <b>Основные возможности:</b>\n"
+            f"• Управление администраторами\n"
+            f"• Мут, бан и кик пользователей\n"
+            f"• Получение ID пользователей\n\n"
+            f"💡 <i>Используйте /help для полного списка команд</i>"
+        )
+        self.save_data()
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Помощь по командам"""
         chat_id = update.effective_chat.id
@@ -1504,54 +1377,25 @@ class AdvancedAdminBot:
                 "<code>/remove_admin ID</code> - удалить администратора\n\n"
 
                 "🔇 <b>Мут:</b>\n"
-                "<code>/mute ID</code> - мут пользователя\n"
-                "<code>/unmute ID</code> - размутить\n"
-                "<code>/mutelist</code> - список мутов\n\n"
+                "<code>/mute ID [время]</code> - мут пользователя\n"
+                "<code>/unmute ID</code> - размутить\n\n"
 
                 "🚫 <b>Бан:</b>\n"
-                "<code>/ban ID</code> - бан пользователя\n"
-                "<code>/unban ID</code> - разбанить\n"
-                "<code>/banlist</code> - список банов\n\n"
+                "<code>/ban ID [время]</code> - бан пользователя\n"
+                "<code>/unban ID</code> - разбанить\n\n"
 
                 "👢 <b>Кик:</b>\n"
                 "<code>/kick ID</code> - кикнуть пользователя\n\n"
-
-                "🔔 <b>Уведомления:</b>\n"
-                "<code>/add_notify интервал текст</code> - добавить уведомление\n"
-                "<code>/remove_notify ID</code> - удалить уведомление\n"
-                "<code>/notify_list</code> - список уведомлений\n"
-                "<code>/test_notify ID</code> - тест уведомления\n\n"
-
-                "<code>/fix_rights</code> - проверить права бота\n\n"
             )
 
         help_text += (
             "💡 <b>Советы:</b>\n"
             "• Используйте ID вместо username для команд\n"
             "• Для мута/бана/кика/добавления админа можно ответить на сообщение\n"
-            "• Каждый чат имеет отдельный список администраторов\n"
-            "• Уведомления работают даже после перезапуска бота"
+            "• Каждый чат имеет отдельный список администраторов"
         )
 
-        await update.message.reply_text(help_text, parse_mode='HTML')
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда start"""
-        chat_id = update.effective_chat.id
-        chat_data = self.get_chat_data(chat_id)
-
-        # Активируем бота в чате
-        await update.message.reply_text(
-            f"✅ <b>Продвинутый бот-администратор активирован!</b>\n\n"
-            f"⚡ <b>Основные возможности:</b>\n"
-            f"• Управление администраторами\n"
-            f"• Мут, бан и кик пользователей\n"
-            f"• Периодические уведомления\n"
-            f"• Получение ID пользователей\n\n"
-            f"💡 <i>Используйте /help для полного списка команд</i>",
-            parse_mode='HTML'
-        )
-        self.save_data()
+        await self.send_safe_message(context, chat_id, help_text)
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статус бота"""
@@ -1560,31 +1404,26 @@ class AdvancedAdminBot:
         is_admin = await self.is_admin(chat_id, update.effective_user.id)
         admin_status = "👑 Администратор" if is_admin else "👤 Пользователь"
 
-        notify_count = len(chat_data.get('notifications', {}))
-        ban_count = len(chat_data.get('banned_users', {}))
-
         status_text = (
             "🤖 <b>Статус бота:</b>\n\n"
             f"✅ <b>Бот активен</b>\n"
             f"👑 <b>Администраторов:</b> {len(chat_data['admin_users'])}\n"
-            f"🔔 <b>Активных уведомлений:</b> {notify_count}\n"
-            f"🚫 <b>Забаненных:</b> {ban_count}\n"
             f"💬 <b>ID чата:</b> <code>{chat_id}</code>\n"
             f"🎯 <b>Ваш статус:</b> {admin_status}\n\n"
             f"💡 <i>Бот работает стабильно</i> 🚀"
         )
-        await update.message.reply_text(status_text, parse_mode='HTML')
+        await self.send_safe_message(context, chat_id, status_text)
 
     async def fix_rights_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Проверка прав бота"""
-        if not await self.check_admin_access(update):
+        if not await self.check_admin_access(update, context):
             return
 
         chat_id = update.effective_chat.id
 
         try:
-            chat = await self.application.bot.get_chat(chat_id)
-            bot_member = await self.application.bot.get_chat_member(chat_id, self.application.bot.id)
+            chat = await context.bot.get_chat(chat_id)
+            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
 
             rights_info = (
                 "🔧 <b>Проверка прав бота:</b>\n\n"
@@ -1621,44 +1460,37 @@ class AdvancedAdminBot:
             rights_info += "• Право 'Закреплять сообщения'\n\n"
             rights_info += "💡 <i>Обратитесь к создателю чата для выдачи прав</i>"
 
-            await update.message.reply_text(rights_info, parse_mode='HTML')
+            await self.send_safe_message(context, chat_id, rights_info)
 
         except Exception as e:
-            await update.message.reply_text(
+            await self.send_safe_message(
+                context, chat_id,
                 f"❌ <b>Ошибка проверки прав:</b>\n\n"
                 f"<code>{e}</code>\n\n"
-                f"💡 <i>Убедитесь что бот добавлен в группу и является администратором</i>",
-                parse_mode='HTML'
+                f"💡 <i>Убедитесь что бот добавлен в группу и является администратором</i>"
             )
 
-    async def run(self):
-        """Запуск бота"""
-        self.load_data()
-
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-
-        logger.info("🤖 Продвинутый бот-администратор запущен!")
-        logger.info(f"📊 Активных чатов: {len(self.chat_data)}")
-
-        # Запускаем все уведомления
-        await self.start_all_notification_tasks()
-        logger.info("🔔 Все уведомления запущены")
+    def run(self):
+        """Запуск бота - упрощенная версия"""
+        print("🚀 Запуск бота...")
+        self.application.run_polling()
 
 
 if __name__ == "__main__":
     print("🚀 Запуск продвинутого бота-администратора...")
     print(f"👑 Главный админ ID: {MAIN_ADMIN_ID}")
-    print("💡 Возможности: мут, бан, кик, уведомления, управление админами")
+    print("💡 Возможности: мут, бан, кик, управление админами")
     print("💡 Каждый чат имеет отдельный список администраторов")
     print("💡 Используйте /help для списка команд")
 
     bot = AdvancedAdminBot(BOT_TOKEN)
 
     try:
-        asyncio.run(bot.run())
+        bot.run()
     except KeyboardInterrupt:
         print("\n🛑 Бот остановлен пользователем")
     except Exception as e:
         print(f"❌ Критическая ошибка: {e}")
+        import traceback
+
+        traceback.print_exc()
