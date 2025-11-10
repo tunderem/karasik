@@ -881,7 +881,7 @@ class SimpleAttendanceBot:
             "🤖 <b>Статус бота:</b>\n\n"
             f"✅ <b>Бот активен</b>\n"
             f"📅 <b>Расписание:</b> Каждый понедельник в 19:00\n"
-            f"🕐 <b>Следующий понедельник:</b> {self.get_next_monday_date()}\n"
+            f"🕐 <b>завтра:</b> {self.get_next_monday_date()}\n"
             f"👥 <b>Текущие голоса:</b> {len(chat_data['votes'])}\n"
             f"👑 <b>Администраторов:</b> {len(chat_data['admin_users'])}\n"
             f"💬 <b>ID чата:</b> <code>{chat_id}</code>\n"
@@ -950,7 +950,7 @@ class SimpleAttendanceBot:
             chat_data['current_poll_id'] = str(int(datetime.now().timestamp()))
 
             message_text = (
-                f"<b>🗓️ Посещаемость на следующий понедельник</b>\n"
+                f"<b>🗓️ Посещаемость на завтра</b>\n"
                 f"<b>📅 {self.get_next_monday_date()} (Понедельник)</b>\n\n"
                 "❓ <b>Кто приходит?</b>\n\n"
                 "✅ <b>К 1</b> - приду к первому уроку\n"
@@ -1038,7 +1038,7 @@ class SimpleAttendanceBot:
 
         total_votes = len(chat_data['votes'])
 
-        text = f"<b>📊 Посещаемость на следующий понедельник:</b>\n"
+        text = f"<b>📊 Посещаемость на завтра:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [
@@ -1077,7 +1077,7 @@ class SimpleAttendanceBot:
             display_name = f"{name} (@{username})" if username else name
             votes_by_option[option].append(display_name)
 
-        text = f"<b>👥 Кто приходит в следующий понедельник:</b>\n"
+        text = f"<b>👥 Кто приходит в завтра:</b>\n"
         text += f"<b>📅 {self.get_next_monday_date()}</b>\n\n"
 
         options = [

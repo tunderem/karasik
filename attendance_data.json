@@ -19,12 +19,19 @@
     "-1002919624785": {
       "last_poll_message_id": 6229,
       "current_poll_id": "1762790430",
-      "votes": {},
+      "votes": {
+        "2073879359": {
+          "option": "2",
+          "name": "パーヴェル",
+          "timestamp": "2025-11-10T19:15:12.151236",
+          "username": "tunderem"
+        }
+      },
       "admin_users": [
         2073879359
       ],
       "last_updated": "2025-11-10T19:00:30.588214"
     }
   },
-  "last_updated": "2025-11-10T19:00:31.150478"
+  "last_updated": "2025-11-10T19:15:12.464339"
 }
